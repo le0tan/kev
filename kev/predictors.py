@@ -85,17 +85,21 @@ class RemotePredictor:
     server-reported model id so the manifest can pin what was scored. `concurrency` is how many requests kev.benchmark may
     keep in flight at once (each call is independent: one request, its own retries); 1 scores sequentially."""
 
-    def __init__(self, base_url, model="kev-latest", api_key="local", timeout=120, retries=3, concurrency=1):
+    def __init__(self, base_url, model="kev-latest", api_key="local", timeout=120, retries=3, concurrency=1, api_header="authorization"):
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
+        if not api_header:
+            raise ValueError("api_header must be non-empty")
         self.base_url, self.model, self.api_key, self.timeout, self.retries = base_url.rstrip("/"), model, api_key, timeout, retries
+        self.api_header = api_header
         self.concurrency = concurrency
         self.served_model = None
 
     def __call__(self, record):
         payload = json.dumps({**api_request(record), "model": self.model}).encode()
+        auth_value = f"Bearer {self.api_key}" if self.api_header.lower() == "authorization" else self.api_key
         req = urllib.request.Request(f"{self.base_url}/v1/systemone", data=payload, method="POST",
-                                    headers={"content-type": "application/json", "authorization": f"Bearer {self.api_key}"})
+                                    headers={"content-type": "application/json", self.api_header: auth_value})
         last = None
         for attempt in range(self.retries):
             try:

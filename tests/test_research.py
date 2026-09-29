@@ -808,7 +808,7 @@ def test_private_suite_fetches_from_its_own_mirror(tmp_path, monkeypatch):
         S.load_split(evals, "test", allow_test=True)
 
 def test_remote_predictor_maps_system_one_answers_and_retries(monkeypatch):
-    import io, json
+    import json
     from kev.predictors import RemotePredictor
     rec = {"state": "s", "questions": {"q": {"type": "choice", "instructions": "i", "criteria": {"a": "A", "b": "B"}, "label": "a", "src": "t"},
                                        "y": {"type": "noul", "instructions": "i", "label": True, "src": "t"}}}
@@ -819,13 +819,31 @@ def test_remote_predictor_maps_system_one_answers_and_retries(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
     def urlopen(req, timeout):
-        calls.append(json.loads(req.data))
+        calls.append((json.loads(req.data), {k.lower(): v for k, v in req.header_items()}))
         if len(calls) == 1: raise OSError("503")
         return Resp({"model": "openjev-x", "answers": {"q": {"type": "choice", "probabilities": {"a": 0.7, "b": 0.3}}, "y": {"type": "noul", "noul": 0.2}}, "usage": {"input_tokens": 12}})
     p = RemotePredictor("http://example.test/", retries=2); monkeypatch.setattr("urllib.request.urlopen", urlopen); monkeypatch.setattr("time.sleep", lambda s: None)
     out = p(rec)
     assert out["probabilities"] == {"q": {"a": 0.7, "b": 0.3}, "y": {"true": 0.2, "false": 0.8}} and p.served_model == "openjev-x" and len(calls) == 2
-    assert calls[0]["model"] == "kev-latest" and "label" not in json.dumps(calls[0])        # labels never leave the machine
+    assert calls[0][0]["model"] == "kev-latest" and "label" not in json.dumps(calls[0][0])   # labels never leave the machine
+    assert calls[0][1]["authorization"] == "Bearer local"
+
+def test_remote_predictor_can_send_a_custom_api_header(monkeypatch):
+    import json
+    from kev.predictors import RemotePredictor
+    rec = {"state": "s", "questions": {"q": {"type": "noul", "instructions": "i", "label": True, "src": "t"}}}
+    seen = {}
+    class Resp:
+        def read(self): return json.dumps({"model": "m", "answers": {"q": {"type": "noul", "noul": 0.8}}}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+    def urlopen(req, timeout):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return Resp()
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+    out = RemotePredictor("http://example.test", api_key="jwt", api_header="X-Jwt-Token")(rec)
+    assert out["probabilities"] == {"q": {"true": 0.8, "false": 0.19999999999999996}}
+    assert seen["x-jwt-token"] == "jwt" and "authorization" not in seen
 
 def test_concurrent_predictions_keep_record_order_and_sequential_failure_semantics(tmp_path):
     """A predictor with `concurrency` > 1 is scored on a thread pool; the rows, predictions.jsonl order and coverage must be
