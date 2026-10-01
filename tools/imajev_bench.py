@@ -111,7 +111,7 @@ def cmd_run(a):
     import torch
     pool = [json.loads(l) for l in open(a.pool)]
     n_q = sum(len(p["questions"]) for p in pool)
-    print(f"pool: {len(pool)} requests, {n_q} questions, sha {a.pool_sha if a.pool_sha else sha256_file(a.pool)}", flush=True)
+    print(f"pool: {len(pool)} requests, {n_q} questions, sha {sha256_file(a.pool)}", flush=True)
     if a.side == "native":
         run_native(a, pool, n_q)
     else:
