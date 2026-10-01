@@ -30,7 +30,7 @@ sys.path.insert(0, os.environ["IMAJEV_SCRIPTS"])
 
 from kev.imajev_adapter import (DECISION_TAIL, ImajevAssets, imajev_encode, imajev_modules, load_imajev,
                                 score_request, verify_adapter_mapping)
-from kev.model import ContextOverflow, DecisionModel, load_tokenizer
+from kev.model import ContextOverflow, DecisionModel, load_tokenizer, rows_of
 
 
 def read_records(path, limit=0):
@@ -255,14 +255,19 @@ def adapted_picks(model, payload, rotations, max_length, single=False):
     native = imajev_modules()
     encs, request, plan, meta = imajev_encode(model.imajev, payload, rotations=rotations, max_state=max_length, max_branch=max_length)
     if single:
+        # split along rows_of exactly: row k = state + branch k alone (state ids/pos verbatim, branch k's
+        # own tokens at their absolute positions) — never state + earlier branches
         split, split_meta = [], []
         for enc, enc_meta in zip(encs, meta["encs"]):
-            Ls = enc["seg"].count(0)
-            for t, (j, offset) in enumerate(enc_meta["rows"]):
-                end = enc["decide_idx"][t] + 1
-                split.append({"ids": enc["ids"][:end], "seg": [0] * Ls + [1] * (end - Ls), "pos": list(range(end)),
-                              "opt": [-1] * end, "option_isolation": False, "decide_idx": [end - 1], "opt_idx": [[]],
-                              "labels": [enc["labels"][t]], "state_truncated": False, "rows": [(j, offset)]})
+            state_ids, state_pos, rows = rows_of(enc)
+            Ls = len(state_ids)
+            for t, (row, (j, offset)) in enumerate(zip(rows, enc_meta["rows"])):
+                ids = list(state_ids) + list(row["ids"])
+                split.append({"ids": ids, "seg": [0] * Ls + [1] * len(row["ids"]),
+                              "pos": list(state_pos) + list(row["pos"]), "opt": [-1] * len(ids),
+                              "option_isolation": False, "decide_idx": [Ls + row["decide"]],
+                              "opt_idx": [[Ls + o for o in row["opts"]]], "labels": [enc["labels"][t]],
+                              "state_truncated": False, "rows": [(j, offset)]})
                 split_meta.append({"rows": [(j, offset)]})
         encs, meta = split, {**meta, "encs": split_meta}
     picks, _ = model.hidden_picks_batch(encs, [None] * len(encs), [False] * len(encs))
