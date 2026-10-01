@@ -219,11 +219,11 @@ def native_prompt_rows(engine, payload, rotations):
     return request, rows
 
 
-def native_logits(engine, rows):
-    """candidate_logits_batch over token-budgeted batches (the evaluate_decision_model_torch batching)."""
+def native_logits(engine, rows, single=False):
+    """candidate_logits_batch over token-budgeted batches (the evaluate_decision_model_torch batching);
+    single=True runs every row alone, which quantifies the native path's own batch-composition noise."""
     keys, values = [], []
-    batch, longest = [], 0
-    budget = 16000
+    budget = 1 if single else 16000
 
     def flush():
         if not batch:
@@ -236,6 +236,7 @@ def native_logits(engine, rows):
             values.append([float(x) for x in lg])
         batch.clear()
 
+    batch, longest = [], 0
     for r in rows:
         n = len(engine.processor.tokenizer(r[2], add_special_tokens=False).input_ids)
         if batch and (max(longest, n) * (len(batch) + 1) > budget or len(batch) >= 48):
@@ -346,7 +347,7 @@ def cmd_forward(a):
     for item in expanded:
         payload = item["record_payload"]
         n_request, prow = native_prompt_rows(engine, payload, a.rotations)
-        n_keys, n_vals = native_logits(engine, prow)
+        n_keys, n_vals = native_logits(engine, prow, single=a.native_batch_1)
         encs, a_request, plan, meta, picks, per = adapted_picks(model, payload, a.rotations, a.max_length)
         built_keys = []
         for enc, enc_meta in zip(encs, meta["encs"]):
@@ -398,7 +399,8 @@ def cmd_forward(a):
     summary = {"rows": len(report_rows), "argmax_flips": flips, "abstain_flips": abstains,
                "max_abs_dlogit": worst_row["max_abs_dlogit"], "worst_row": {k: worst_row[k] for k in ("record", "field_id", "offset")},
                "max_abs_answer_diff": worst_ans, "mismatches": [d["mismatch"] for d in answer_diffs if d.get("mismatch")],
-               "graphs": a.graphs, "fused": a.fused, "long": a.long, "rotations": a.rotations, "device": a.device}
+               "graphs": a.graphs, "fused": a.fused, "long": a.long, "rotations": a.rotations, "device": a.device,
+               "native_batch_1": a.native_batch_1}
     print(json.dumps(summary, indent=1))
     if a.json_out:
         json.dump({"summary": summary, "rows": report_rows, "answers": answer_diffs}, open(a.json_out, "w"), indent=1)
@@ -422,6 +424,7 @@ def main():
     ap.add_argument("--long", action="store_true", help="append an over-graph-limit state record (eager prefix path)")
     ap.add_argument("--small", action="store_true", help="two tiny records only (CPU runs)")
     ap.add_argument("--max-chunks", type=int, default=0, help="keep at most this many 8-question chunks per record (0 = all)")
+    ap.add_argument("--native-batch-1", action="store_true", help="run the native side one row per batch (controls for native batch noise)")
     ap.add_argument("--json-out", help="write the full row report here")
     a = ap.parse_args()
     {"tokens": cmd_tokens, "codebook": cmd_codebook, "mapping": cmd_mapping, "forward": cmd_forward}[a.command](a)
