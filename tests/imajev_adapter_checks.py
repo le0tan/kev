@@ -308,6 +308,27 @@ def diff_answers(native_answer, adapted_answer, path="$"):
     return worst, bad
 
 
+def exec_path_audit(native_model, kev_model):
+    """Which kernels actually execute on each side: the hub-kernels package state, each backbone's
+    configured attention implementation, and the decoder-layer module classes (kev's fused rewrite
+    shows up as different layer classes). Evidence of the executed path, not just importability."""
+    from collections import Counter
+    out = {}
+    try:
+        import kernels
+        out["kernels_pkg"] = f"{getattr(kernels, '__version__', '?')}@{kernels.__file__}"
+    except Exception as e:
+        out["kernels_pkg"] = f"NOT importable: {e}"
+    for label, root in (("native", native_model), ("kev", kev_model)):
+        core = root.get_base_model() if hasattr(root, "get_base_model") else root
+        cfg = getattr(core, "config", None)
+        out[f"{label}_attn_implementation"] = getattr(cfg, "_attn_implementation", None)
+        layers = getattr(core, "model", None)
+        layers = getattr(layers, "layers", None) or getattr(core, "layers", None)
+        out[f"{label}_decoder_layer_classes"] = dict(Counter(type(l).__name__ for l in layers)) if layers else "n/a"
+    return out
+
+
 def dtype_audit(module):
     """Per-class parameter dtype counts (base / lora / readout), not a single sampled param."""
     from collections import Counter
@@ -351,6 +372,7 @@ def cmd_forward(a):
           f"mapping {report['tensors']} tensors / {report['modules']} modules; graphs={model.graphs is not None}", flush=True)
     print(f"dtype audit native: {dtype_audit(engine.model)}", flush=True)
     print(f"dtype audit kev:    {dtype_audit(model.lm)}", flush=True)
+    print(f"[exec-path] {exec_path_audit(engine.model, model.lm)}", flush=True)
 
     records = sample_records(read_records(a.data, a.records), small=a.small)
     expanded = []
