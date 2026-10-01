@@ -281,8 +281,8 @@ def run_kev(a, pool, n_q):
                 done, _ = wait(set(fut_req), return_when=FIRST_COMPLETED)
                 for f in done:
                     r = fut_req.pop(f)
-                    _, stats = f.result()
-                    for _, s in stats: batch_shapes.append((s["tokens"], s["state_tokens"]))
+                    _, s = f.result()   # per-encoding stats dict
+                    batch_shapes.append((s["tokens"], s["state_tokens"]))
                     remaining[r] -= 1
                     if remaining[r] == 0:
                         active -= 1
