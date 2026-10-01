@@ -384,7 +384,7 @@ def cmd_forward(a):
             t_row = meta["encs"][enc_i]["rows"].index((j, offset))
             dec_pos, dec_tok = encs[enc_i]["decide_idx"][t_row], encs[enc_i]["ids"][encs[enc_i]["decide_idx"][t_row]]
             report_rows.append({"record": item["label"], "field_id": meta["fields"][j].id,
-                                "qid": item["id_map"].get(meta["fields"][j].id, meta["fields"][j].id),
+                                "qid": item.get("id_map", {}).get(meta["fields"][j].id, meta["fields"][j].id),
                                 "offset": offset, "labels": labels_j,
                                 "n_candidates": len(nlog),
                                 "decide_position": dec_pos, "decide_token_id": dec_tok,
