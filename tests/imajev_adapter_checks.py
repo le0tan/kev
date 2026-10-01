@@ -287,6 +287,20 @@ def diff_answers(native_answer, adapted_answer, path="$"):
 def cmd_forward(a):
     from peft import PeftModel
     from torch_decision import TorchDecision
+    if str(a.device) == "cpu":
+        # CPU smoke: the DeltaNet conv/delta-rule kernels are CUDA-only; hide fla and causal_conv1d from
+        # transformers so both engines fall back to the same torch-only path and the comparison stays fair
+        import importlib.util
+        real_find_spec = importlib.util.find_spec
+
+        def _no_cuda_kernels(name, *args, **kwargs):
+            if name.split(".")[0] in ("fla", "causal_conv1d"):
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        importlib.util.find_spec = _no_cuda_kernels
+        sys.modules.update({name: None for name in ("fla", "causal_conv1d")})
+        print("cpu run: fla/causal_conv1d hidden, transformers torch-only fallback on both sides", flush=True)
     native = imajev_modules()
     print(f"[{time.strftime('%H:%M:%S')}] loading the native engine (original adapter, unmerged) on {a.device} ...", flush=True)
     t0 = time.time()
@@ -337,7 +351,8 @@ def cmd_forward(a):
         built_keys = []
         for enc, enc_meta in zip(encs, meta["encs"]):
             built_keys += [(j, offset) for j, offset in enc_meta["rows"]]
-        assert built_keys == [(j, offset) for j, offset in n_keys], f"{item['label']}: row keys/order differ between paths"
+        assert sorted(built_keys) == sorted((j, offset) for j, offset in n_keys), \
+            f"{item['label']}: row keys differ between paths (groups may interleave row order; keyed join below)"
         for (j, offset), nlog in zip(n_keys, n_vals):
             alog = per[(j, offset)]
             n64, a64 = torch.tensor(nlog, dtype=torch.float64), torch.tensor(alog, dtype=torch.float64)
@@ -371,7 +386,8 @@ def cmd_forward(a):
         a_resp = score_request(model.imajev, a_request, plan, meta, picks)
         worst, bad = diff_answers(n_resp["answers"], a_resp["answers"])
         answer_diffs.append({"record": item["label"], "kind": "answers_vs_native", "max_abs_diff": worst, "mismatch": bad})
-        print(f"[{time.strftime('%H:%M:%S')}] {item['label']}: {len(n_keys)} rows, "
+        print(f"[{time.strftime('%H:%M:%S')}] {item['label']}: {len(n_keys)} rows in {len(encs)} prefix group(s) "
+              f"(state tokens {[enc['seg'].count(0) for enc in encs]}), "
               f"max|dlogit|={max(r['max_abs_dlogit'] for r in report_rows if r['record'] == item['label']):.3e}, "
               f"answers max|diff|={worst:.3e}{' MISMATCH ' + bad if bad else ''}", flush=True)
 

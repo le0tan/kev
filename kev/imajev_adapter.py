@@ -306,7 +306,9 @@ def imajev_encode(assets, payload, rotations=1, max_state=SERVE_MAX_STATE, max_b
 def score_request(assets, request, plan, meta, picks_per_enc):
     """Native scoring over the picked hidden states: per row, the readout logits of that row's labels; per
     field, one pass through result_from_logits (single rotation, tie-break by lowest vocabulary token id) or
-    combine_rotations (rotation-averaged); then jev_api.to_response for the Jev answer shapes."""
+    combine_rotations (rotation-averaged); then jev_api.to_response for the Jev answer shapes. Rows may arrive
+    split across prefix groups in any group order, so a field's passes are sorted by offset first (the native
+    order)."""
     native = imajev_modules()
     per_field = {}
     for enc_picks, enc_meta in zip(picks_per_enc, meta["encs"]):
@@ -314,7 +316,7 @@ def score_request(assets, request, plan, meta, picks_per_enc):
             per_field.setdefault(j, []).append((offset, h))
     results = []
     for j in range(len(meta["fields"])):
-        passes = per_field[j]
+        passes = sorted(per_field[j], key=lambda p: p[0])
         if len(passes) == 1 and passes[0][0] == 0:
             logits = [float(x) for x in assets.logits(passes[0][1], meta["labels"][j])]
             result = native.result_from_logits(meta["choices"][j], logits, token_ids=meta["token_ids"][j])
