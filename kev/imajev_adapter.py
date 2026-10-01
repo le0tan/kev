@@ -206,9 +206,12 @@ def load_imajev(base_dir, adapter_dir, device, opts=None, dtype=None, cuda_graph
     # autocast_adapter_dtype=True -> the unmerged LoRA stays fp32 (deltas computed in fp32, added to the
     # bf16 base output). Casting the wrapped model here would round the LoRA to bf16 — a load-semantics
     # difference from the native engine, so only the merged path casts, exactly like native merge_adapter:
-    # merge first (B@A*scaling in lora_B.weight.dtype, += into the base weight: one rounding), then .to(dtype).
+    # merge first, then .to(dtype).
     if merged:
         m.lm = m.lm.merge_and_unload()
+        # peft merge, precisely: delta = (B@A)*scaling is computed in fp32 (lora_B.weight.dtype), then
+        # cast to the base dtype and added into the bf16 base weight — rounding happens at the delta cast
+        # and again in the bf16 add; i.e. fp32 delta math merged into bf16 the way PEFT natively does it
         if dtype != torch.float32:
             m.lm = m.lm.to(dtype)
     m.eval()
