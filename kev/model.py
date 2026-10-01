@@ -217,6 +217,13 @@ def probs_one(model, enc, prefix, keep):
     return model.probs_and_prefix(enc) if keep else (model.probs(enc), None)
 
 
+def hidden_picks_one(model, enc, prefix, keep):
+    """hidden-state counterpart of probs_one: the eager fallback of hidden_picks_batch. It extracts the picked
+    hidden states itself (state pass + branch rows), never through probs_one's PointerHead readouts."""
+    if prefix is not None: return model.hidden_with_prefix(enc, prefix), prefix
+    return model.hidden_and_prefix(enc) if keep else (model.hidden_rows(enc), None)
+
+
 class DecisionModel(nn.Module):
     def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32,
                  weights=None, direct_load=False):
@@ -480,6 +487,99 @@ class DecisionModel(nn.Module):
         z = self.head.many(X[dec], X[opt], own)
         Z = torch.full((len(ks), max(ks)), float("-inf"), device=self.device).index_put_((own, sl), z)
         return torch.softmax(Z, -1)[own, sl].cpu().split(ks)
+
+    # --- hidden-state consumers (kev.imajev_adapter): the same serving layout as probs_batch, with the picked
+    # decide-position hidden states returned instead of the PointerHead's probabilities. Additive only: every
+    # probs path above is untouched, and the eager fallback here never routes through probs_one/PointerHead.
+
+    def _picks_from_rows(self, hs, rows):
+        """The decide-position hidden state [d] fp32 of each row, cloned off the row's [L, d] hidden."""
+        return [h[r["decide"]].clone() for h, r in zip(hs, rows)]
+
+    @torch.no_grad()
+    def hidden_rows(self, enc):
+        """Decide-position hidden states of one encoding's question rows (the hidden-state analogue of probs'
+        miss path). Row form: a state pass, then the branch rows on its cache. Packed form: one hidden_batch."""
+        if self.rows_form([enc]): return self.hidden_and_prefix(enc)[0]
+        h = self.hidden_batch([enc])[0]
+        return [h[d].clone() for d in enc["decide_idx"]]
+
+    @torch.no_grad()
+    def hidden_and_prefix(self, enc):
+        """hidden_rows() that also returns the state prefix: a miss is one pass that also returns the prefix, as in
+        probs_and_prefix (row form: a state pass kept as the prefix, then the branch rows on its cache).
+        -> (picks, (n_state_tokens, kv cache, state hiddens or None))."""
+        Ls = enc["seg"].count(0)
+        if self.rows_form([enc]):
+            Ls, cache, h_state = self.prefix(enc)
+            _, _, rows = rows_of(enc)
+            hs = self._rows_hidden([(r["ids"], r["pos"]) for r in rows], cache=cache, prefix_len=Ls)
+            return self._picks_from_rows(hs, rows), (Ls, cache, h_state)
+        ids = torch.tensor([enc["ids"]], device=self.device); pos = torch.tensor([enc["pos"]], device=self.device)
+        dt = next(self.lm.parameters()).dtype
+        mask = branch_mask_batch([enc["seg"]], self.device, dtype=dt, opts=[enc["opt"]] if enc.get("option_isolation") else None)
+        out = self.lm(input_ids=ids, position_ids=pos, attention_mask=mask, past_key_values=DynamicCache(config=self.lm.config), use_cache=True)
+        h = out.last_hidden_state[0].float()
+        out.past_key_values.crop(-(len(enc["ids"]) - Ls))     # keep the state only
+        return [h[d].clone() for d in enc["decide_idx"]], (Ls, out.past_key_values, h[:Ls].clone())
+
+    @torch.no_grad()
+    def hidden_with_prefix(self, enc, prefix):
+        """hidden_rows() for a record whose state tokens equal the cached prefix's; only the branches run. The
+        cache is cropped back to the state afterwards so it can be reused, as in probs_with_prefix."""
+        Ls, cache, h_state = prefix
+        if enc["seg"].count(0) != Ls: raise ValueError("prefix does not match this record's state")
+        if self.rows_form([enc]):
+            _, _, rows = rows_of(enc)
+            hs = self._rows_hidden([(r["ids"], r["pos"]) for r in rows], cache=cache, prefix_len=Ls)
+            return self._picks_from_rows(hs, rows)
+        ids = torch.tensor([enc["ids"][Ls:]], device=self.device); pos = torch.tensor([enc["pos"][Ls:]], device=self.device)
+        dt = next(self.lm.parameters()).dtype
+        mask = branch_mask_batch([enc["seg"]], self.device, dtype=dt, opts=[enc["opt"]] if enc.get("option_isolation") else None)[:, :, Ls:, :]
+        try:
+            out = self.lm(input_ids=ids, position_ids=pos, past_key_values=cache, attention_mask=mask, use_cache=True)
+            h = torch.cat([h_state, out.last_hidden_state[0].float()], 0)
+        finally:
+            cache.crop(-(len(enc["ids"]) - Ls))
+        return [h[d].clone() for d in enc["decide_idx"]]
+
+    @torch.no_grad()
+    def hidden_picks_batch(self, encs, prefixes, keep):
+        """kev.serve's model thread for hidden-state consumers: probs_batch's exact layout and batching (state
+        prefix reuse, the eager prefix path for states the graphed state pass refuses, CUDA graphs) with the
+        pointer-head readout replaced by the picked hidden states themselves.
+
+        -> (picks per request, prefix per request). picks[i] is one decide-position hidden state [d] fp32 per
+        question of encs[i], in question order. The graphed path splits the same X CudaGraphs.run returns for
+        probs_batch (each question's picks are its <decide> then its options; the hidden interface reads the
+        first of them and imajev rows carry no options); the eager fallback goes through hidden_picks_one,
+        independently of probs_one and PointerHead."""
+        splits = [rows_of(e) for e in encs]
+        def fits(i, cached):
+            S, _, rows = splits[i]
+            return self.graphs is not None and self.graphs.admits(len(S), [len(r["ids"]) for r in rows], cached)
+        long = {i for i in range(len(encs)) if prefixes[i] is None and not fits(i, False) and fits(i, True)}
+        batched = [i for i in range(len(encs)) if i in long or fits(i, prefixes[i] is not None)]
+        out = {i: hidden_picks_one(self, encs[i], prefixes[i], keep[i]) for i in sorted(set(range(len(encs))) - set(batched))}
+        runs, held = [[]], 0   # graphed runs, each holding at most EAGER_STATES long states' eager prefixes at once
+        for i in batched:
+            if i in long and held == EAGER_STATES: runs.append([]); held = 0
+            runs[-1].append(i); held += i in long
+        from .cuda_graphs import Request   # here, not at the top: the HF Space vendors model.py without cuda_graphs.py
+        for run in filter(None, runs):
+            pre = {i: self.prefix(encs[i]) if i in long else prefixes[i] for i in run}
+            X, caches = self.graphs.run([Request(splits[i][0], splits[i][1], [(r["ids"], r["pos"]) for r in splits[i][2]],
+                                                 None if pre[i] is None else pre[i][1], keep[i], [[r["decide"], *r["opts"]] for r in splits[i][2]])
+                                         for i in run])   # per question its picks: the decide position, then its options
+            cursor = 0
+            for i, cache in zip(run, caches):
+                picks, cursor = [], cursor
+                for r in splits[i][2]:
+                    picks.append(X[cursor].clone())   # [d] fp32; a clone so the batch buffer is not retained
+                    cursor += 1 + len(r["opts"])
+                made = pre[i] if i in long else None if cache is None else (len(splits[i][0]), cache, None)
+                out[i] = picks, prefixes[i] or (made if keep[i] else None)
+        return [out[i][0] for i in range(len(encs))], [out[i][1] for i in range(len(encs))]
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
