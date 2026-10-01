@@ -98,7 +98,7 @@ class UtilSampler:
             utils = [s[1] for s in self.samples]
             mems = [s[2] for s in self.samples]
             print(f"[gpu] util avg={sum(utils) / len(utils):.0f}% max={max(utils)}% "
-                  f"mem_used max={max(mem)}MiB over {len(self.samples)} samples", flush=True)
+                  f"mem_used max={max(mems)}MiB over {len(self.samples)} samples", flush=True)
 
 
 def pct(vals, p):
@@ -126,6 +126,14 @@ def run_native(a, pool, n_q):
     from torch_decision import TorchDecision
     from vision_decision.scoring import compile_question, cyclic_offsets
     from vision_decision.jev_api import to_request_with_plan
+
+    # kernel-enablement evidence: the official eval config runs with the hub-kernels package on the path
+    # (transformers uses it for the hybrid backbone when importable and silently falls back otherwise)
+    try:
+        import kernels
+        print(f"[cfg] hub kernels ENABLED (kernels={getattr(kernels, '__version__', '?')}, path={kernels.__file__})", flush=True)
+    except Exception as e:
+        print(f"[cfg] hub kernels NOT importable ({e}) — slow fallback, NOT the official-kernels config", flush=True)
 
     t0 = time.time()
     engine = TorchDecision(a.base, "cuda", dtype=torch.bfloat16)
@@ -196,6 +204,7 @@ def run_native(a, pool, n_q):
                 print(f"[jit] first native batch ({len(idxs)} tasks): {_dt:.2f}s", flush=True)
             t_fwd += _dt
             batch_shapes.append((len(idxs), int(max(len(t) for t in inputs["input_ids"]))))
+            print(f"[batch] {len(batch_shapes)}/{len(batches)} n={len(idxs)} maxtok={batch_shapes[-1][1]} {_dt:.2f}s", flush=True)
             done += len(idxs)
     t_e2e = time.time() - t_all
     summary = {"side": "native", "requests": len(pool), "questions": n_q, "tasks": len(tasks),
@@ -224,11 +233,13 @@ def run_kev(a, pool, n_q):
     server = ImajevServer(base=a.base, adapter=a.adapter, tok=tok, model=model, device="cuda", max_length=4096)
     t_cold = time.time() - t0
 
-    # JIT: encode one request, run it through the server, capture the pending graphs
+    # JIT: encode one request, run it through the server, let the model thread capture at its own idle point.
+    # NEVER call model.graphs.capture_pending() off the model thread: it races the model thread's idle
+    # auto-capture (imajev_serve._work), and concurrent captures abort the process. wait_idle blocks until
+    # the queue is drained and no capture is pending or mid-flight.
     t1 = time.time()
     encs0, req0, plan0, meta0 = imajev_encode(model.imajev, pool[0], rotations=1, max_state=4096, max_branch=4096)
     picks0 = [server.submit_enc(e).result() for e in encs0]
-    model.graphs.capture_pending()
     server.wait_idle()
     t_jit = time.time() - t1
     stats_after_capture = model.graphs.stats() if model.graphs is not None else None
@@ -243,24 +254,55 @@ def run_kev(a, pool, n_q):
         encoded.append((p, encs, request, plan, meta))
 
     batch_shapes = []
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.reset_peak_memory_stats()   # query only; no sync — all CUDA stays on the model thread
     t_all = time.time()
     t_fwd = 0.0
     n_batches = 0
-    with UtilSampler() as sampler:
-        for p, encs, request, plan, meta in encoded:
-            futures = [server.submit_enc(e) for e in encs]
-            t2 = time.time()
-            picked = [f.result() for f in futures]
-            # no torch.cuda.synchronize() here: the model thread's own copy-out already syncs its stream, and a
-            # main-thread sync can land inside a mid-load capture window (legacy stream vs capturing blocking stream)
-            t_fwd += time.time() - t2
-            for _, stats in picked:
-                batch_shapes.append((stats["tokens"], stats["state_tokens"]))
+    if a.concurrency > 1:
+        # bounded C-N window: up to N requests in flight, the model thread batches whatever is queued
+        # (cross-request batching, MAX_BATCH=64 encodings); no HTTP, same ImajevServer path
+        from collections import defaultdict
+        from concurrent.futures import FIRST_COMPLETED, wait
+        reqs = encoded
+        nxt, active, fut_req, remaining = 0, 0, {}, {}
+
+        def submit_next():
+            nonlocal nxt
+            if nxt >= len(reqs): return False
+            p, encs, request, plan, meta = reqs[nxt]
+            remaining[nxt] = len(encs)
+            for e in encs: fut_req[server.submit_enc(e)] = nxt
+            nxt += 1
+            return True
+
+        with UtilSampler() as sampler:
+            while active < a.concurrency and submit_next(): active += 1
+            while fut_req:
+                done, _ = wait(set(fut_req), return_when=FIRST_COMPLETED)
+                for f in done:
+                    r = fut_req.pop(f)
+                    _, stats = f.result()
+                    for _, s in stats: batch_shapes.append((s["tokens"], s["state_tokens"]))
+                    remaining[r] -= 1
+                    if remaining[r] == 0:
+                        active -= 1
+                        if submit_next(): active += 1
             server.wait_idle()
-            n_batches += 1
-        t_e2e = time.time() - t_all
+        t_e2e = t_fwd = time.time() - t_all
+    else:
+        with UtilSampler() as sampler:
+            for p, encs, request, plan, meta in encoded:
+                futures = [server.submit_enc(e) for e in encs]
+                t2 = time.time()
+                picked = [f.result() for f in futures]
+                # no torch.cuda.synchronize() here: the model thread's own copy-out already syncs its stream, and a
+                # main-thread sync can land inside a mid-load capture window (legacy stream vs capturing blocking stream)
+                t_fwd += time.time() - t2
+                for _, stats in picked:
+                    batch_shapes.append((stats["tokens"], stats["state_tokens"]))
+                server.wait_idle()
+                n_batches += 1
+            t_e2e = time.time() - t_all
     # answers assembly is part of end-to-end scoring; time one full pass including score_request
     t3 = time.time()
     x0 = encoded[0]
@@ -269,6 +311,7 @@ def run_kev(a, pool, n_q):
     score_request(model.imajev, x0[2], x0[3], x0[4], [pk for pk, _ in picks])
     t_score = time.time() - t3
     summary = {"side": "kev", "requests": len(pool), "questions": n_q,
+               "concurrency": a.concurrency,
                "cold_load_s": round(t_cold, 2), "jit_warm_capture_s": round(t_jit, 2),
                "encode_s": round(t_enc, 2), "forward_s": round(t_fwd, 2),
                "score_sample_s": round(t_score, 2), "end_to_end_s": round(t_e2e, 2),
@@ -281,6 +324,8 @@ def run_kev(a, pool, n_q):
                "row_tokens_p90": pct([b[0] for b in batch_shapes], .9),
                "row_tokens_max": max((b[0] for b in batch_shapes), default=0),
                "batches": server.batches, "batched_requests": server.batched_requests,
+               "requests_per_batch": round(server.batched_requests / server.batches, 2) if server.batches else None,
+               "rows_per_batch": round(len(batch_shapes) / server.batches, 2) if server.batches else None,
                "prefix_cache": {"hits": server.prefix_cache.hits, "misses": server.prefix_cache.misses,
                                 "oom_retries": server.prefix_cache.oom_retries},
                "graphs_final": model.graphs.stats() if model.graphs is not None else None,
@@ -307,6 +352,8 @@ def main():
     r.add_argument("--adapter", help="kev-compatible adapter copy (kev side)")
     r.add_argument("--adapter-orig", help="original imajev adapter (native side)")
     r.add_argument("--out", help="summary JSON out")
+    r.add_argument("--concurrency", type=int, default=1,
+                   help="kev side: in-flight request window (1 = serial per request, C1 baseline)")
     r.set_defaults(func=lambda x: None)
     a = ap.parse_args()
     if a.cmd == "build-pool":
