@@ -25,21 +25,32 @@ def load(path):
         key = f"{ridx}:{chunk}:{qid}"
         u = a["unknown_probability"]
         if a["type"] == "noul":
+            # kev boolean (jev_api.to_response): noul = true_raw + 0.5*u; official canonical reconstructs
+            # true = min(1-u, max(0, noul-0.5u)), false = 1-u-true
             true_p = min(1.0 - u, max(0.0, a["noul"] - 0.5 * u))
             false_p = 1.0 - u - true_p
             served = {"true": true_p, "false": false_p, "__unknown__": u}
             label = max(served, key=served.get)
-            out[key] = ("noul", label, max(true_p, false_p), label if label != "__unknown__" else "", u,
-                        {"noul": a["noul"], "u": u})
+            top = max(("true", "false"), key=lambda k: served[k])
+            out[key] = ("boolean", label, served[top], top, u,
+                        {"served": served, "noul": a["noul"], "u": u})
         elif a["type"] == "choice":
             probs = a["probabilities"]
             # stored probabilities are known-renormalized (sum to 1); the official canonical_distribution
-            # serves p*(1-u) per option plus __unknown__=u, so argmax must include that scaling
+            # serves p*(1-u) per option plus __unknown__=u, so argmax must include that scaling.
+            # native's to_answer writes booleans in this shape too (probabilities over true/false) —
+            # reduce those to the boolean form; the math reduces to the same served distribution
+            if set(probs) == {"true", "false"}:
+                served = {"true": probs["true"] * (1 - u), "false": probs["false"] * (1 - u), "__unknown__": u}
+                label = max(served, key=served.get)
+                top = max(("true", "false"), key=lambda k: served[k])
+                out[key] = ("boolean", label, served[top], top, u, {"served": served, "u": u})
+                return
             served = {k: v * (1.0 - u) for k, v in probs.items()}; served["__unknown__"] = u
             label = max(served, key=served.get)
             top_name = max(probs, key=probs.get)
-            out[key] = ("choice", label, probs[top_name], top_name, u,
-                        {"choice": a["choice"], "probs": probs, "u": u})
+            out[key] = ("choice", label, probs[top_name] * (1.0 - u), top_name, u,
+                        {"choice": a.get("choice"), "probs": probs, "u": u})
         else:
             raise SystemExit(f"unknown answer type {a['type']!r} for {key}")
 
@@ -68,7 +79,7 @@ def compare(A, B, la, lb):
         only_a = set(A) - set(B); only_b = set(B) - set(A)
         raise SystemExit(f"qid sets differ: only-{la}={len(only_a)} only-{lb}={len(only_b)} (first: {sorted(only_a)[:3]} / {sorted(only_b)[:3]})")
     known_flip = abstain_flip = both_unknown = exact_float = 0
-    du, dknown, dnoul = [], [], []
+    du, dknown, dtrue = [], [], []
     flip_rows = []
     for qid in qids:
         ta, la_, ka, na, ua, rawa = A[qid]
@@ -80,14 +91,16 @@ def compare(A, B, la, lb):
         if rawa == rawb: exact_float += 1
         du.append(abs(ua - ub))
         dknown.append(abs(ka - kb))
-        if ta == "noul": dnoul.append(abs(rawa["noul"] - rawb["noul"]))
+        if ta == "boolean" and "served" in rawa and "served" in rawb:
+            dtrue.append(abs(rawa["served"]["true"] - rawb["served"]["true"]))
         if la_ != lb_:
             flip_rows.append({"qid": qid, "type": ta, f"label_{la}": la_, f"label_{lb}": lb_,
-                              f"u_{la}": ua, f"u_{lb}": ub})
+                              f"u_{la}": ua, f"u_{lb}": ub,
+                              **{f"served_{la}": rawa.get("served"), f"served_{lb}": rawb.get("served")}})
     return {"questions": len(qids), "known_class_flips": known_flip, "abstain_flips": abstain_flip,
             "both_unknown": both_unknown, "identical_answer_dicts": exact_float,
             "unknown_prob_diff": pdiff(du), "top_known_prob_diff": pdiff(dknown),
-            "noul_value_diff": pdiff(dnoul) if dnoul else None, "flips": flip_rows}
+            "served_true_diff": pdiff(dtrue) if dtrue else None, "flips": flip_rows}
 
 
 def main():
