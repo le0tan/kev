@@ -255,28 +255,27 @@ def run_native(a, pool, n_q):
 
     order = sorted(range(len(tasks)), key=lambda i: len(rendered[i][0]))
     batches = [order[bi:bi + 32] for bi in range(0, len(order), 32)]
-    batch_shapes = []
-    from queue import Queue
-    q = Queue(maxsize=3)
 
-    def collate_worker():
-        for idxs in batches:
-            batch = [rendered[i] for i in idxs]
-            inputs, token_ids_list, _targets = engine.collate(batch)
-            q.put((idxs, inputs, token_ids_list))
-        q.put(None)
+    def native_pass(score):
+        """One full-pool pass (length-sorted batches of 32 through candidate_logits_batch). Returns
+        (t_fwd, t_jit, t_score, n_answered, n_abstained, batch_shapes). Scoring runs whenever score=True
+        so every pass takes the same path; answers are only written by the timed pass."""
+        from queue import Queue
+        q = Queue(maxsize=3)
 
-    collate_thread = threading.Thread(target=collate_worker, daemon=True)
-    collate_thread.start()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    t_all = time.time()
-    t_fwd = t_jit = t_score = 0.0
-    first = True
-    done = 0
-    n_answered = n_abstained = 0
-    answers_f = open(a.answers_out, "w") if a.answers_out else None
-    with UtilSampler() as sampler:
+        def collate_worker():
+            for idxs in batches:
+                batch = [rendered[i] for i in idxs]
+                inputs, token_ids_list, _targets = engine.collate(batch)
+                q.put((idxs, inputs, token_ids_list))
+            q.put(None)
+
+        collate_thread = threading.Thread(target=collate_worker, daemon=True)
+        collate_thread.start()
+        t_fwd = t_jit = t_score = 0.0
+        first = True
+        n_answered = n_abstained = 0
+        shapes = []
         while True:
             item = q.get()
             if item is None:
@@ -293,7 +292,7 @@ def run_native(a, pool, n_q):
                 first = False
                 print(f"[jit] first native batch ({len(idxs)} tasks): {_dt:.2f}s", flush=True)
             t_fwd += _dt
-            if answers_f is not None:
+            if score:
                 # native scoring/answer assembly inside the measured window (D2H already synced above)
                 _ts = time.time()
                 for k, i in enumerate(idxs):
@@ -305,16 +304,32 @@ def run_native(a, pool, n_q):
                     n_answered += result.status == "answered"
                     n_abstained += result.status == "abstained"
                 t_score += time.time() - _ts
-            batch_shapes.append((len(idxs), int(max(len(t) for t in inputs["input_ids"]))))
-            print(f"[batch] {len(batch_shapes)}/{len(batches)} n={len(idxs)} maxtok={batch_shapes[-1][1]} {_dt:.2f}s", flush=True)
-            done += len(idxs)
+            shapes.append((len(idxs), int(max(len(t) for t in inputs["input_ids"]))))
+            print(f"[batch{'/timed' if score else '/warm'}] {len(shapes)}/{len(batches)} n={len(idxs)} "
+                  f"maxtok={shapes[-1][1]} {_dt:.2f}s", flush=True)
+        return t_fwd, t_jit, t_score, n_answered, n_abstained, shapes
+
+    t_warm = None
+    if a.warmup_pass:
+        _tw = time.time()
+        native_pass(score=False)
+        t_warm = time.time() - _tw
+        print(f"[warmup] native full pool pass {t_warm:.1f}s (untimed; JIT/autotune shapes absorbed here)", flush=True)
+
+    answers_f = open(a.answers_out, "w") if a.answers_out else None
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t_all = time.time()
+    with UtilSampler() as sampler:
+        t_fwd, t_jit, t_score, n_answered, n_abstained, batch_shapes = native_pass(score=answers_f is not None)
     t_e2e = time.time() - t_all
     if answers_f is not None:
         answers_f.close()
         print(f"[answers] native: {n_answered + n_abstained} rows written ({n_answered} answered, {n_abstained} abstained)", flush=True)
     summary = {"side": "native", "requests": len(pool), "questions": n_q, "tasks": len(tasks),
                "cold_load_s": round(t_cold, 2), "jit_first_batch_s": round(t_jit, 2),
-               "render_s": round(t_render, 2), "forward_s": round(t_fwd, 2), "score_s": round(t_score, 2),
+               "render_s": round(t_render, 2), "warmup_pass_s": round(t_warm, 2) if t_warm is not None else None,
+               "forward_s": round(t_fwd, 2), "score_s": round(t_score, 2),
                "scored_in_window": answers_f is not None,
                "end_to_end_s": round(t_e2e, 2),
                "questions_per_s_end_to_end": round(n_q / t_e2e, 1), "questions_per_s_forward": round(n_q / t_fwd, 1),
@@ -337,6 +352,8 @@ def run_kev(a, pool, n_q):
 
     if a.max_batch:
         os.environ["KEV_MAX_BATCH"] = str(a.max_batch)   # serve-layer switch, read at server construction
+    if a.prefix_size:
+        os.environ["KEV_PREFIX_CACHE"] = str(a.prefix_size)   # prefix-cache LRU capacity in states
 
     t0 = time.time()
     tok, model, rep = load_imajev(a.base, a.adapter, "cuda", dtype=torch.bfloat16,
@@ -558,9 +575,12 @@ def main():
     r.add_argument("--concurrency", type=int, default=1,
                    help="kev side: in-flight request window (1 = serial per request, C1 baseline)")
     r.add_argument("--warmup-pass", action="store_true",
-                   help="kev side: one untimed full-pool pass (identical submit+score path) before the timed window")
+                   help="one untimed full-pool pass (identical submit+score path) before the timed window "
+                        "(both sides: native absorbs JIT/autotune, kev absorbs graph capture + cache)")
     r.add_argument("--max-batch", type=int, default=None,
                    help="kev side: override the model thread's max encodings per batch (KEV_MAX_BATCH; default 64)")
+    r.add_argument("--prefix-size", type=int, default=None,
+                   help="kev side: prefix-cache LRU capacity in distinct states (KEV_PREFIX_CACHE; default 4)")
     r.set_defaults(func=lambda x: None)
     a = ap.parse_args()
     if a.cmd == "build-pool":
