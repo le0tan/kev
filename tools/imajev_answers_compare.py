@@ -33,7 +33,9 @@ def load(path):
                         {"noul": a["noul"], "u": u})
         elif a["type"] == "choice":
             probs = a["probabilities"]
-            served = dict(probs); served["__unknown__"] = u
+            # stored probabilities are known-renormalized (sum to 1); the official canonical_distribution
+            # serves p*(1-u) per option plus __unknown__=u, so argmax must include that scaling
+            served = {k: v * (1.0 - u) for k, v in probs.items()}; served["__unknown__"] = u
             label = max(served, key=served.get)
             top_name = max(probs, key=probs.get)
             out[key] = ("choice", label, probs[top_name], top_name, u,
