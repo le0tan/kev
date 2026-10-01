@@ -248,10 +248,23 @@ def native_logits(engine, rows, single=False):
     return keys, values
 
 
-def adapted_picks(model, payload, rotations, max_length):
-    """imajev_encode -> hidden_picks_batch -> per (field, offset) logits over that field's labels."""
+def adapted_picks(model, payload, rotations, max_length, single=False):
+    """imajev_encode -> hidden_picks_batch -> per (field, offset) logits over that field's labels. single=True
+    gives every row its own encoding (own state pass, no shared prefix, no batch padding) — kev's single-row
+    reference; same ids, same positions, one member per group."""
     native = imajev_modules()
     encs, request, plan, meta = imajev_encode(model.imajev, payload, rotations=rotations, max_state=max_length, max_branch=max_length)
+    if single:
+        split, split_meta = [], []
+        for enc, enc_meta in zip(encs, meta["encs"]):
+            Ls = enc["seg"].count(0)
+            for t, (j, offset) in enumerate(enc_meta["rows"]):
+                end = enc["decide_idx"][t] + 1
+                split.append({"ids": enc["ids"][:end], "seg": [0] * Ls + [1] * (end - Ls), "pos": list(range(end)),
+                              "opt": [-1] * end, "option_isolation": False, "decide_idx": [end - 1], "opt_idx": [[]],
+                              "labels": [enc["labels"][t]], "state_truncated": False, "rows": [(j, offset)]})
+                split_meta.append({"rows": [(j, offset)]})
+        encs, meta = split, {**meta, "encs": split_meta}
     picks, _ = model.hidden_picks_batch(encs, [None] * len(encs), [False] * len(encs))
     per = {}
     for enc_picks, enc_meta in zip(picks, meta["encs"]):
@@ -305,14 +318,14 @@ def cmd_forward(a):
     native = imajev_modules()
     print(f"[{time.strftime('%H:%M:%S')}] loading the native engine (original adapter, unmerged) on {a.device} ...", flush=True)
     t0 = time.time()
-    engine = TorchDecision(a.base, a.device)
+    engine = TorchDecision(a.base, a.device, dtype=getattr(torch, a.dtype))
     engine.model = PeftModel.from_pretrained(engine.model, a.adapter_orig).eval()
     engine.enable_readout(a.adapter_orig, trainable=False)
     print(f"[{time.strftime('%H:%M:%S')}] native engine ready in {time.time() - t0:.0f}s "
           f"(codes={engine.codes}, layout={engine.prompt_layout})", flush=True)
     print(f"[{time.strftime('%H:%M:%S')}] loading the kev backend (remapped copy, unmerged) on {a.device} ...", flush=True)
     t0 = time.time()
-    tok, model, report = load_imajev(a.base, a.adapter, a.device, dtype=torch.bfloat16,
+    tok, model, report = load_imajev(a.base, a.adapter, a.device, dtype=getattr(torch, a.dtype),
                                      cuda_graphs=a.graphs, fused=a.fused, merge=a.fused or None)
     print(f"[{time.strftime('%H:%M:%S')}] kev backend ready in {time.time() - t0:.0f}s; "
           f"mapping {report['tensors']} tensors / {report['modules']} modules; graphs={model.graphs is not None}", flush=True)
@@ -340,7 +353,7 @@ def cmd_forward(a):
     if a.graphs and model.graphs is not None:
         # warm the buckets eagerly, then capture the way the serving loop does, so the record loop below
         # replays captured graphs; the per-record comparison is then graphs-on vs the detached eager path
-        adapted_picks(model, expanded[0]["record_payload"], a.rotations, a.max_length)
+        adapted_picks(model, expanded[0]["record_payload"], a.rotations, a.max_length, single=a.adapted_single)
         model.graphs.capture_pending()
         print(f"[{time.strftime('%H:%M:%S')}] cuda graphs after capture: {model.graphs.stats()}", flush=True)
     graphs_obj = model.graphs
@@ -348,7 +361,7 @@ def cmd_forward(a):
         payload = item["record_payload"]
         n_request, prow = native_prompt_rows(engine, payload, a.rotations)
         n_keys, n_vals = native_logits(engine, prow, single=a.native_batch_1)
-        encs, a_request, plan, meta, picks, per = adapted_picks(model, payload, a.rotations, a.max_length)
+        encs, a_request, plan, meta, picks, per = adapted_picks(model, payload, a.rotations, a.max_length, single=a.adapted_single)
         built_keys = []
         for enc, enc_meta in zip(encs, meta["encs"]):
             built_keys += [(j, offset) for j, offset in enc_meta["rows"]]
@@ -371,7 +384,7 @@ def cmd_forward(a):
         if a.graphs and graphs_obj is not None:
             g_picks = picks
             model.graphs = None
-            _, _, _, _, e_picks, _ = adapted_picks(model, payload, a.rotations, a.max_length)
+            _, _, _, _, e_picks, _ = adapted_picks(model, payload, a.rotations, a.max_length, single=a.adapted_single)
             model.graphs = graphs_obj
             d = max((float((gh - eh).abs().max()) for gg, eg in zip(g_picks, e_picks) for gh, eh in zip(gg, eg)), default=0.0)
             answer_diffs.append({"record": item["label"], "kind": "graphs_vs_eager_picks", "max_abs_dlogit": d})
@@ -387,8 +400,9 @@ def cmd_forward(a):
         a_resp = score_request(model.imajev, a_request, plan, meta, picks)
         worst, bad = diff_answers(n_resp["answers"], a_resp["answers"])
         answer_diffs.append({"record": item["label"], "kind": "answers_vs_native", "max_abs_diff": worst, "mismatch": bad})
+        groups = [enc["seg"].count(0) for enc in encs]
         print(f"[{time.strftime('%H:%M:%S')}] {item['label']}: {len(n_keys)} rows in {len(encs)} prefix group(s) "
-              f"(state tokens {[enc['seg'].count(0) for enc in encs]}), "
+              f"(state tokens {groups[:4]}{'...' if len(groups) > 4 else ''}), "
               f"max|dlogit|={max(r['max_abs_dlogit'] for r in report_rows if r['record'] == item['label']):.3e}, "
               f"answers max|diff|={worst:.3e}{' MISMATCH ' + bad if bad else ''}", flush=True)
 
@@ -400,7 +414,7 @@ def cmd_forward(a):
                "max_abs_dlogit": worst_row["max_abs_dlogit"], "worst_row": {k: worst_row[k] for k in ("record", "field_id", "offset")},
                "max_abs_answer_diff": worst_ans, "mismatches": [d["mismatch"] for d in answer_diffs if d.get("mismatch")],
                "graphs": a.graphs, "fused": a.fused, "long": a.long, "rotations": a.rotations, "device": a.device,
-               "native_batch_1": a.native_batch_1}
+               "native_batch_1": a.native_batch_1, "adapted_single": a.adapted_single, "dtype": a.dtype}
     print(json.dumps(summary, indent=1))
     if a.json_out:
         json.dump({"summary": summary, "rows": report_rows, "answers": answer_diffs}, open(a.json_out, "w"), indent=1)
@@ -425,6 +439,8 @@ def main():
     ap.add_argument("--small", action="store_true", help="two tiny records only (CPU runs)")
     ap.add_argument("--max-chunks", type=int, default=0, help="keep at most this many 8-question chunks per record (0 = all)")
     ap.add_argument("--native-batch-1", action="store_true", help="run the native side one row per batch (controls for native batch noise)")
+    ap.add_argument("--adapted-single", action="store_true", help="run the kev side one row per encoding (controls for kev batch noise)")
+    ap.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16", help="weight dtype for both engines (fp32 = the precision control)")
     ap.add_argument("--json-out", help="write the full row report here")
     a = ap.parse_args()
     {"tokens": cmd_tokens, "codebook": cmd_codebook, "mapping": cmd_mapping, "forward": cmd_forward}[a.command](a)
