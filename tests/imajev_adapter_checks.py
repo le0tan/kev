@@ -366,10 +366,24 @@ def cmd_forward(a):
                 kept.append(e)
         expanded = kept
     if a.long:
-        first = imajev_payloads(records[-1]["record"], native)[0][0]
-        padded = dict(first["state"])
-        padded["padding"] = "long evidence. " * 600    # ~2.7k state tokens: past the graphed state pass, under max_length
-        expanded.append({"label": "long_state", "record_payload": {**first, "state": padded}})
+        # long evidence to push the state past the graphed state pass but under the 4096 row limit:
+        # validate with the encoder itself (its state/row limits are the same tokens the native side checks)
+        base = imajev_payloads(records[-1]["record"], native)[0][0]
+        payload = None
+        for reps in (600, 480, 360, 240, 120):
+            state = {**base["state"], "padding": "long evidence. " * reps}
+            try:
+                imajev_encode(model.imajev, {**base, "state": state}, rotations=a.rotations,
+                              max_state=a.max_length, max_branch=a.max_length)
+            except ContextOverflow:
+                continue
+            payload = {**base, "state": state}
+            print(f"--long: state padding x{reps} fits under max_length {a.max_length}", flush=True)
+            break
+        if payload is not None:
+            expanded.append({"label": "long_state", "record_payload": payload})
+        else:
+            print("--long: no padding size fit under max_length; record skipped", flush=True)
 
     report_rows, answer_diffs = [], []
     if a.graphs and model.graphs is not None:
@@ -449,6 +463,10 @@ def cmd_forward(a):
 
     flips = sum(r["argmax_flip"] for r in report_rows)
     abstains = sum(r["abstain_flip"] for r in report_rows)
+    graphs_final = None
+    if a.graphs and model.graphs is not None:
+        model.graphs.capture_pending()
+        graphs_final = model.graphs.stats()
     worst_row = max(report_rows, key=lambda r: r["max_abs_dlogit"])
     worst_ans = max(d["max_abs_diff"] for d in answer_diffs if d["kind"] == "answers_vs_native")
     def _pd(module):
@@ -472,7 +490,8 @@ def cmd_forward(a):
                "max_abs_answer_diff": worst_ans, "mismatches": [d["mismatch"] for d in answer_diffs if d.get("mismatch")],
                "dtype": dtype_block,
                "graphs": a.graphs, "fused": a.fused, "long": a.long, "rotations": a.rotations, "device": a.device,
-               "native_batch_1": a.native_batch_1, "adapted_single": a.adapted_single}
+               "native_batch_1": a.native_batch_1, "adapted_single": a.adapted_single,
+               "graphs_final": graphs_final}
     print(json.dumps(summary, indent=1))
     if a.json_out:
         json.dump({"summary": summary, "rows": report_rows, "answers": answer_diffs}, open(a.json_out, "w"), indent=1)
