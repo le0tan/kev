@@ -30,7 +30,7 @@ sys.path.insert(0, os.environ["IMAJEV_SCRIPTS"])
 
 from kev.imajev_adapter import (DECISION_TAIL, ImajevAssets, imajev_encode, imajev_modules, load_imajev,
                                 score_request, verify_adapter_mapping)
-from kev.model import ContextOverflow, DecisionModel, load_tokenizer, rows_of
+from kev.model import ContextOverflow, DecisionModel, load_tokenizer, hidden_picks_one, rows_of
 
 
 def read_records(path, limit=0):
@@ -270,7 +270,12 @@ def adapted_picks(model, payload, rotations, max_length, single=False):
                               "state_truncated": False, "rows": [(j, offset)]})
                 split_meta.append({"rows": [(j, offset)]})
         encs, meta = split, {**meta, "encs": split_meta}
-    picks, _ = model.hidden_picks_batch(encs, [None] * len(encs), [False] * len(encs))
+    if single:
+        # one enc per forward (hidden_picks_one, the eager fallback path itself): the true single-row
+        # reference with no cross-encoding batching at all
+        picks = [hidden_picks_one(model, enc, None, False)[0] for enc in encs]
+    else:
+        picks, _ = model.hidden_picks_batch(encs, [None] * len(encs), [False] * len(encs))
     per = {}
     for enc_picks, enc_meta in zip(picks, meta["encs"]):
         for (j, offset), h in zip(enc_meta["rows"], enc_picks):
