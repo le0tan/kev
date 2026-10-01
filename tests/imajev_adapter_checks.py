@@ -454,6 +454,10 @@ def cmd_forward(a):
     def _pd(module):
         try:
             return str(next(module.parameters()).dtype)
+        except Exception:
+            pass
+        try:
+            return str(module.weight.dtype)          # plain-tensor "readouts" (assets.readout is a tensor)
         except Exception as exc:
             return f"n/a ({exc.__class__.__name__})"
     dtype_block = {
@@ -461,7 +465,7 @@ def cmd_forward(a):
         "native_audit": dtype_audit(engine.model),
         "kev_audit": dtype_audit(model.lm),
         "native_readout": str(engine.readout.weight.dtype) if hasattr(engine, "readout") else _pd(getattr(engine, "readout", None)),
-        "kev_readout": _pd(model.imajev.readout),
+        "kev_readout": str(model.imajev.readout.dtype),
     }
     summary = {"rows": len(report_rows), "argmax_flips": flips, "abstain_flips": abstains,
                "max_abs_dlogit": worst_row["max_abs_dlogit"], "worst_row": {k: worst_row[k] for k in ("record", "field_id", "offset")},
