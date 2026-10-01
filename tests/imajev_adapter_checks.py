@@ -308,6 +308,16 @@ def diff_answers(native_answer, adapted_answer, path="$"):
     return worst, bad
 
 
+def dtype_audit(module):
+    """Per-class parameter dtype counts (base / lora / readout), not a single sampled param."""
+    from collections import Counter
+    hist = Counter()
+    for name, p in module.named_parameters():
+        kind = "lora" if ".lora_" in name else ("readout" if "readout" in name else "base")
+        hist[(kind, str(p.dtype))] += 1
+    return {f"{k} x{d}": n for (k, d), n in sorted(hist.items())}
+
+
 def cmd_forward(a):
     from peft import PeftModel
     from torch_decision import TorchDecision
@@ -339,6 +349,8 @@ def cmd_forward(a):
                                      cuda_graphs=a.graphs, fused=a.fused, merge=a.fused or None)
     print(f"[{time.strftime('%H:%M:%S')}] kev backend ready in {time.time() - t0:.0f}s; "
           f"mapping {report['tensors']} tensors / {report['modules']} modules; graphs={model.graphs is not None}", flush=True)
+    print(f"dtype audit native: {dtype_audit(engine.model)}", flush=True)
+    print(f"dtype audit kev:    {dtype_audit(model.lm)}", flush=True)
 
     records = sample_records(read_records(a.data, a.records), small=a.small)
     expanded = []
@@ -446,10 +458,10 @@ def cmd_forward(a):
             return f"n/a ({exc.__class__.__name__})"
     dtype_block = {
         "requested": a.dtype,
-        "native_engine_param": _pd(engine.model),
-        "kev_model_param": _pd(model),
-        "kev_readout_param": _pd(model.imajev.readout),
-        "native_engine_readout": _pd(engine.model.readout) if hasattr(engine.model, "readout") else "n/a",
+        "native_audit": dtype_audit(engine.model),
+        "kev_audit": dtype_audit(model.lm),
+        "native_readout": str(engine.readout.weight.dtype) if hasattr(engine, "readout") else _pd(getattr(engine, "readout", None)),
+        "kev_readout": _pd(model.imajev.readout),
     }
     summary = {"rows": len(report_rows), "argmax_flips": flips, "abstain_flips": abstains,
                "max_abs_dlogit": worst_row["max_abs_dlogit"], "worst_row": {k: worst_row[k] for k in ("record", "field_id", "offset")},

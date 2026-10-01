@@ -196,15 +196,21 @@ def load_imajev(base_dir, adapter_dir, device, opts=None, dtype=None, cuda_graph
     from peft import PeftModel
     opts = opts or LoadOptions.from_env()
     dtype = dtype or opts.dtype or torch.float32
-    merged = (merge if merge is not None else False) or bool(fused or opts.fused)
+    fused = bool(fused or opts.fused)        # env switch and explicit flag are the same thing
+    merged = (merge if merge is not None else False) or fused
     tok = load_tokenizer(base_dir)
     m = DecisionModel(base_dir, tok, device, dtype=dtype, attn=opts.attn)
     m.lm = PeftModel.from_pretrained(m.lm, adapter_dir, torch_device=str(device)).to(device)
     report = verify_adapter_mapping(adapter_dir, m.lm)
+    # native load order (torch_decision eval path): the base loads in `dtype`, then peft wraps it with
+    # autocast_adapter_dtype=True -> the unmerged LoRA stays fp32 (deltas computed in fp32, added to the
+    # bf16 base output). Casting the wrapped model here would round the LoRA to bf16 — a load-semantics
+    # difference from the native engine, so only the merged path casts, exactly like native merge_adapter:
+    # merge first (B@A*scaling in lora_B.weight.dtype, += into the base weight: one rounding), then .to(dtype).
     if merged:
-        m.lm = m.lm.merge_and_unload()          # W += delta: fp32 math, one rounding (LoadOptions.merge)
-    if dtype != torch.float32:
-        m.lm = m.lm.to(dtype)
+        m.lm = m.lm.merge_and_unload()
+        if dtype != torch.float32:
+            m.lm = m.lm.to(dtype)
     m.eval()
     serving = str(device).startswith("cuda") and m.hybrid
     if fused and serving and merged:
