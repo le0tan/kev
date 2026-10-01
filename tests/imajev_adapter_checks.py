@@ -205,17 +205,17 @@ def cmd_mapping(a):
 
 
 def native_prompt_rows(engine, payload, rotations):
-    """(field, offset, rendered, token_ids, labels) per row, the native eval's per-prompt path."""
+    """(field index, offset, rendered, token_ids, labels) per row, the native eval's per-prompt path."""
     native = imajev_modules()
     request, _ = native.jev_api.to_request_with_plan(payload, request_id="check", max_options=engine.codes - 1)
     rows = []
-    for f in request.fields:
+    for j, f in enumerate(request.fields):
         header, choices, texts = native.compile_question(f, request.state, engine.prompt_layout)
         labels = engine.labels(len(choices), 0)
         for offset in native.cyclic_offsets(len(choices), rotations):
             prompt = header + "\n".join(f"{l}: {t}" for l, t in zip(labels, native.rotate(texts, offset)))
             rendered, images, token_ids = engine.render_example(None, prompt, labels)
-            rows.append((f.id, offset, rendered, token_ids, labels))
+            rows.append((j, offset, rendered, token_ids, labels))
     return request, rows
 
 
