@@ -206,7 +206,7 @@ def run_native(a, pool, n_q):
                "batch_max_tokens_p50": pct([b[1] for b in batch_shapes], .5),
                "batch_max_tokens_max": max((b[1] for b in batch_shapes), default=0),
                "peak_mem_MiB": round(torch.cuda.max_memory_allocated() / 2**20),
-               "gpu_util_avg_pct": round(sum(s[1] for s in sampler.samples) / max(len(sampler.samples), 1), 1),
+               "gpu_util_avg_pct": round(sum(s[1] for s in sampler.samples) / len(sampler.samples), 1) if sampler.samples else None,
                "rotations": 1}
     print(json.dumps(summary, indent=1), flush=True)
     if a.out:
@@ -253,7 +253,8 @@ def run_kev(a, pool, n_q):
             futures = [server.submit_enc(e) for e in encs]
             t2 = time.time()
             picked = [f.result() for f in futures]
-            torch.cuda.synchronize()
+            # no torch.cuda.synchronize() here: the model thread's own copy-out already syncs its stream, and a
+            # main-thread sync can land inside a mid-load capture window (legacy stream vs capturing blocking stream)
             t_fwd += time.time() - t2
             for _, stats in picked:
                 batch_shapes.append((stats["tokens"], stats["state_tokens"]))
@@ -284,7 +285,7 @@ def run_kev(a, pool, n_q):
                                 "oom_retries": server.prefix_cache.oom_retries},
                "graphs_final": model.graphs.stats() if model.graphs is not None else None,
                "peak_mem_MiB": round(torch.cuda.max_memory_allocated() / 2**20),
-               "gpu_util_avg_pct": round(sum(s[1] for s in sampler.samples) / max(len(sampler.samples), 1), 1),
+               "gpu_util_avg_pct": round(sum(s[1] for s in sampler.samples) / len(sampler.samples), 1) if sampler.samples else None,
                "rotations": 1}
     print(json.dumps(summary, indent=1), flush=True)
     server.close()
