@@ -106,6 +106,23 @@ def pct(vals, p):
     return vals[min(len(vals) - 1, int(p * len(vals)))] if vals else 0
 
 
+def to_answer(result, qtype):
+    """Mirrors batch_eval.to_answer: internal Result -> response-shaped dict (scores kept for cross-checks)."""
+    scores = result.scores
+    unknown = scores.get("__unknown__", 0.0)
+    known = {k: v for k, v in scores.items() if k != "__unknown__"}
+    total = sum(known.values())
+    if total > 0:
+        known = {k: v / total for k, v in known.items()}
+    base = {"unknown_probability": unknown, "abstained": result.status == "abstained",
+            "scores": dict(scores), "raw_logits": dict(result.raw_logits)}
+    if qtype == "noul":
+        base.update({"type": "noul", "noul": scores.get("true", 0.0) + 0.5 * unknown})
+    else:
+        base.update({"type": "choice", "probabilities": known})
+    return base
+
+
 def cmd_run(a):
     env_assert()
     import torch
@@ -124,7 +141,7 @@ def run_native(a, pool, n_q):
     import torch
     from peft import PeftModel
     from torch_decision import TorchDecision
-    from vision_decision.scoring import compile_question, cyclic_offsets
+    from vision_decision.scoring import compile_question, cyclic_offsets, result_from_logits
     from vision_decision.jev_api import to_request_with_plan
 
     # kernel-enablement evidence: the official eval config runs with the hub-kernels package on the path
@@ -151,7 +168,8 @@ def run_native(a, pool, n_q):
             labels = engine.labels(len(choices), 0)
             offset = cyclic_offsets(len(choices), 1)[0]
             prompt = header + "\n".join(f"{lab}: {txt}" for lab, txt in zip(labels, (texts[offset:] + texts[:offset])))
-            tasks.append({"prompt": prompt, "labels": labels})
+            tasks.append({"prompt": prompt, "labels": labels, "ridx": p["ridx"], "chunk": p["chunk"],
+                          "qid": field.id, "qtype": field.type, "choices": choices})
     t_render0 = time.time()
     rendered = []
     for t in tasks:
@@ -183,9 +201,11 @@ def run_native(a, pool, n_q):
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     t_all = time.time()
-    t_fwd = t_jit = 0.0
+    t_fwd = t_jit = t_score = 0.0
     first = True
     done = 0
+    n_answered = n_abstained = 0
+    answers_f = open(a.answers_out, "w") if a.answers_out else None
     with UtilSampler() as sampler:
         while True:
             item = q.get()
@@ -203,14 +223,32 @@ def run_native(a, pool, n_q):
                 first = False
                 print(f"[jit] first native batch ({len(idxs)} tasks): {_dt:.2f}s", flush=True)
             t_fwd += _dt
+            if answers_f is not None:
+                # native scoring/answer assembly inside the measured window (D2H already synced above)
+                _ts = time.time()
+                for k, i in enumerate(idxs):
+                    t = tasks[i]
+                    result = result_from_logits(t["choices"], outs[k], token_ids=token_ids_list[k])
+                    answers_f.write(json.dumps({"ridx": t["ridx"], "chunk": t["chunk"], "qid": t["qid"],
+                                                "type": t["qtype"], "answer": to_answer(result, t["qtype"])},
+                                               ensure_ascii=False) + "\n")
+                    n_answered += result.status == "answered"
+                    n_abstained += result.status == "abstained"
+                t_score += time.time() - _ts
             batch_shapes.append((len(idxs), int(max(len(t) for t in inputs["input_ids"]))))
             print(f"[batch] {len(batch_shapes)}/{len(batches)} n={len(idxs)} maxtok={batch_shapes[-1][1]} {_dt:.2f}s", flush=True)
             done += len(idxs)
     t_e2e = time.time() - t_all
+    if answers_f is not None:
+        answers_f.close()
+        print(f"[answers] native: {n_answered + n_abstained} rows written ({n_answered} answered, {n_abstained} abstained)", flush=True)
     summary = {"side": "native", "requests": len(pool), "questions": n_q, "tasks": len(tasks),
                "cold_load_s": round(t_cold, 2), "jit_first_batch_s": round(t_jit, 2),
-               "render_s": round(t_render, 2), "forward_s": round(t_fwd, 2), "end_to_end_s": round(t_e2e, 2),
+               "render_s": round(t_render, 2), "forward_s": round(t_fwd, 2), "score_s": round(t_score, 2),
+               "scored_in_window": answers_f is not None,
+               "end_to_end_s": round(t_e2e, 2),
                "questions_per_s_end_to_end": round(n_q / t_e2e, 1), "questions_per_s_forward": round(n_q / t_fwd, 1),
+               "answers_written": n_answered + n_abstained, "answered": n_answered, "abstained": n_abstained,
                "batches": len(batch_shapes), "batch_sizes": sorted({b[0] for b in batch_shapes}),
                "batch_max_tokens_p50": pct([b[1] for b in batch_shapes], .5),
                "batch_max_tokens_max": max((b[1] for b in batch_shapes), default=0),
@@ -226,6 +264,9 @@ def run_kev(a, pool, n_q):
     import torch
     from kev.imajev_adapter import imajev_encode, score_request, load_imajev
     from kev.imajev_serve import ImajevServer
+
+    if a.answers_out and a.concurrency > 1:
+        sys.exit("in-window scoring is implemented for the C1 serial path only")
 
     t0 = time.time()
     tok, model, rep = load_imajev(a.base, a.adapter, "cuda", dtype=torch.bfloat16,
@@ -257,7 +298,11 @@ def run_kev(a, pool, n_q):
     torch.cuda.reset_peak_memory_stats()   # query only; no sync — all CUDA stays on the model thread
     t_all = time.time()
     t_fwd = 0.0
+    t_score = 0.0
     n_batches = 0
+    n_entries = n_answered = n_abstained = 0
+    coverage_missing = []
+    answers_f = open(a.answers_out, "w") if a.answers_out else None
     if a.concurrency > 1:
         # bounded C-N window: up to N requests in flight, the model thread batches whatever is queued
         # (cross-request batching, MAX_BATCH=64 encodings); no HTTP, same ImajevServer path
@@ -300,22 +345,49 @@ def run_kev(a, pool, n_q):
                 t_fwd += time.time() - t2
                 for _, stats in picked:
                     batch_shapes.append((stats["tokens"], stats["state_tokens"]))
+                if answers_f is not None:
+                    # readout + answer assembly inside the measured window (score_request's float() pulls D2H)
+                    t2 = time.time()
+                    resp = score_request(model.imajev, request, plan, meta, [pk for pk, _ in picked])
+                    t_score += time.time() - t2
+                    answers_f.write(json.dumps({"ridx": p["ridx"], "chunk": p["chunk"],
+                                                "n_questions": len(p["questions"]), "answers": resp["answers"]},
+                                               ensure_ascii=False) + "\n")
+                    direct = set(resp["answers"])
+                    owned = {fid for entry in (plan or {}).values() for _, fid in entry["labels"]}
+                    missing = set(p["questions"]) - direct - owned
+                    if missing:
+                        coverage_missing.append({"ridx": p["ridx"], "chunk": p["chunk"], "missing": sorted(missing)})
+                    n_entries += len(resp["answers"])
+                    n_answered += sum(1 for v in resp["answers"].values() if not v.get("abstained"))
+                    n_abstained += sum(1 for v in resp["answers"].values() if v.get("abstained"))
                 server.wait_idle()
                 n_batches += 1
             t_e2e = time.time() - t_all
-    # answers assembly is part of end-to-end scoring; time one full pass including score_request
-    t3 = time.time()
-    x0 = encoded[0]
-    picks = [server.submit_enc(e).result() for e in x0[1]]
-    server.wait_idle()
-    score_request(model.imajev, x0[2], x0[3], x0[4], [pk for pk, _ in picks])
-    t_score = time.time() - t3
+    if answers_f is not None:
+        answers_f.close()
+        print(f"[answers] kev: {n_entries} answer entries, coverage missing: {len(coverage_missing)} requests", flush=True)
+    # answers assembly is part of end-to-end scoring; when every request was already scored in-window
+    # (--answers-out), skip the redundant single-request sample — it re-runs a forward and cannot isolate cost.
+    t_score_sample = None
+    if answers_f is None:
+        t3 = time.time()
+        x0 = encoded[0]
+        picks = [server.submit_enc(e).result() for e in x0[1]]
+        server.wait_idle()
+        score_request(model.imajev, x0[2], x0[3], x0[4], [pk for pk, _ in picks])
+        t_score_sample = time.time() - t3
     summary = {"side": "kev", "requests": len(pool), "questions": n_q,
                "concurrency": a.concurrency,
                "cold_load_s": round(t_cold, 2), "jit_warm_capture_s": round(t_jit, 2),
                "encode_s": round(t_enc, 2), "forward_s": round(t_fwd, 2),
-               "score_sample_s": round(t_score, 2), "end_to_end_s": round(t_e2e, 2),
+               "score_s": round(t_score, 2) if answers_f is not None else None,
+               "scored_in_window": answers_f is not None,
+               "score_sample_s": round(t_score_sample, 2) if t_score_sample is not None else None,
+               "end_to_end_s": round(t_e2e, 2),
                "questions_per_s_end_to_end": round(n_q / t_e2e, 1),
+               "answers_entries": n_entries, "answered": n_answered, "abstained": n_abstained,
+               "coverage_missing_requests": len(coverage_missing), "coverage_ok": not coverage_missing,
                "rows": len(batch_shapes),
                "state_tokens_p50": pct([b[1] for b in batch_shapes], .5),
                "state_tokens_p90": pct([b[1] for b in batch_shapes], .9),
@@ -352,6 +424,9 @@ def main():
     r.add_argument("--adapter", help="kev-compatible adapter copy (kev side)")
     r.add_argument("--adapter-orig", help="original imajev adapter (native side)")
     r.add_argument("--out", help="summary JSON out")
+    r.add_argument("--answers-out", help="write full per-question answers (JSONL) and include readout+answer "
+                                         "assembly in the measured window (native: batch_eval-identical "
+                                         "result_from_logits+to_answer; kev C1: score_request per request)")
     r.add_argument("--concurrency", type=int, default=1,
                    help="kev side: in-flight request window (1 = serial per request, C1 baseline)")
     r.set_defaults(func=lambda x: None)
