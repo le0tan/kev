@@ -47,9 +47,12 @@ class ImajevServer:
     lock: threading.Lock = field(default_factory=threading.Lock)
     batches: int = 0
     batched_requests: int = 0
+    batch_log: list = field(default_factory=list)   # one {"encs","rows","max_tokens"} per _run batch (bench audit)
 
     def __post_init__(self):
         self.model.imajev  # fails fast if the adapter assets were not attached
+        # serve-layer tuning switches, both default to the historical kev behaviour
+        self.max_batch = int(os.environ.get("KEV_MAX_BATCH", str(MAX_BATCH)))
         self.prefix_cache = PrefixCache(int(os.environ.get("KEV_PREFIX_CACHE", "4")),
                                         int(os.environ["KEV_PREFIX_MIN_TOKENS"]) if os.environ.get("KEV_PREFIX_MIN_TOKENS") else self.model.prefix_min_tokens)
         self.queue, self.stopping = queue.Queue(), threading.Event()
@@ -81,7 +84,7 @@ class ImajevServer:
                 if graphs is not None and graphs.capture_due(idle=True):
                     with self.lock: graphs.capture_pending(limit=1)
                 continue
-            while len(batch) < MAX_BATCH:
+            while len(batch) < self.max_batch:
                 try: batch.append(self.queue.get_nowait())
                 except queue.Empty: break
             try:
@@ -108,6 +111,8 @@ class ImajevServer:
         sync(self.device); dt = round((time.time() - t) * 1000, 1)
         self.prefix_cache.store(keys, cached, prefixes)
         self.batches += 1; self.batched_requests += len(encs)
+        self.batch_log.append({"encs": len(encs), "rows": sum(len(e["decide_idx"]) for e in encs),
+                               "max_tokens": max(len(e["ids"]) for e in encs)})
         return [(p, {"tokens": len(enc["ids"]), "state_tokens": enc["seg"].count(0), "latency_ms": dt,
                      "prefix_cache_hit": c is not None})
                 for enc, p, c in zip(encs, picks, cached)]
