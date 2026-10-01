@@ -26,6 +26,7 @@ import torch
 assert os.environ.get("IMAJEV_SRC"), "set IMAJEV_SRC to the imajev repository's src directory"
 assert os.environ.get("IMAJEV_SCRIPTS"), "set IMAJEV_SCRIPTS to the imajev repository's scripts directory"
 sys.path.insert(0, os.environ["IMAJEV_SRC"])
+sys.path.insert(0, os.environ["IMAJEV_SCRIPTS"])
 
 from kev.imajev_adapter import (DECISION_TAIL, ImajevAssets, imajev_encode, imajev_modules, load_imajev,
                                 score_request, verify_adapter_mapping)
@@ -85,18 +86,6 @@ def sample_records(rows, small=False):
         if k in picked and id(picked[k]) not in seen:
             seen.add(id(picked[k]))
             out.append({"label": k, "record": picked[k]})
-    return out
-
-
-def field_rows(assets, native, request, rotations):
-    """The native prompts per (field, offset): header + rotated option lines, rendered through the chat template."""
-    out = []
-    for j, f in enumerate(request.fields):
-        header, choices, texts = native.compile_question(f, request.state, assets.prompt_layout)
-        labels = assets.labels(len(choices))
-        for offset in native.cyclic_offsets(len(choices), rotations):
-            prompt = header + "\n".join(f"{l}: {t}" for l, t in zip(labels, native.rotate(texts, offset)))
-            out.append((j, offset, prompt, labels))
     return out
 
 
@@ -333,6 +322,13 @@ def cmd_forward(a):
         expanded.append({"label": "long_state", "record_payload": {**first, "state": padded}})
 
     report_rows, answer_diffs = [], []
+    if a.graphs and model.graphs is not None:
+        # warm the buckets eagerly, then capture the way the serving loop does, so the record loop below
+        # replays captured graphs; the per-record comparison is then graphs-on vs the detached eager path
+        adapted_picks(model, expanded[0]["record_payload"], a.rotations, a.max_length)
+        model.graphs.capture_pending()
+        print(f"[{time.strftime('%H:%M:%S')}] cuda graphs after capture: {model.graphs.stats()}", flush=True)
+    graphs_obj = model.graphs
     for item in expanded:
         payload = item["record_payload"]
         n_request, prow = native_prompt_rows(engine, payload, a.rotations)
@@ -355,14 +351,15 @@ def cmd_forward(a):
                                 "argmax_flip": int(n64.argmax()) != int(a64.argmax()),
                                 "abstain_flip": rn.status != ra.status,
                                 "native_status": rn.status, "adapted_status": ra.status})
-        # graphs on/off: replayed picks vs the eager path's picks, same records
-        if a.graphs and model.graphs is not None:
+        # graphs on/off: replayed picks vs the detached eager path's picks, same records
+        if a.graphs and graphs_obj is not None:
             g_picks = picks
             model.graphs = None
-            _, _, _, _, e_picks, e_per = adapted_picks(model, payload, a.rotations, a.max_length)
-            model.graphs = _graphs(model)
+            _, _, _, _, e_picks, _ = adapted_picks(model, payload, a.rotations, a.max_length)
+            model.graphs = graphs_obj
             d = max((float((gh - eh).abs().max()) for gg, eg in zip(g_picks, e_picks) for gh, eh in zip(gg, eg)), default=0.0)
             answer_diffs.append({"record": item["label"], "kind": "graphs_vs_eager_picks", "max_abs_dlogit": d})
+            print(f"[{time.strftime('%H:%M:%S')}] {item['label']}: graphs vs eager picks max|d|={d:.3e}, {graphs_obj.stats()}", flush=True)
         # end-to-end answers: native to_response over native logits vs score_request over kev picks
         n_by_key = dict(zip(n_keys, n_vals))
         n_results = []
@@ -391,16 +388,6 @@ def cmd_forward(a):
         json.dump({"summary": summary, "rows": report_rows, "answers": answer_diffs}, open(a.json_out, "w"), indent=1)
         print(f"full report -> {a.json_out}")
     return summary
-
-
-def _graphs(model):
-    """Reattach the CudaGraphs wrapper after the eager comparison detached it."""
-    from kev.cuda_graphs import CudaGraphs
-    if model.graphs is not None:
-        return model.graphs
-    g = CudaGraphs(model.lm, model.pad_id)
-    model.graphs = g
-    return g
 
 
 def main():
