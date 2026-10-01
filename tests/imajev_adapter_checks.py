@@ -56,7 +56,7 @@ def imajev_payloads(record, native):
     qids = list(qs)
     for i in range(0, len(qids), 8):
         sub = {qid: qs[qid] for qid in qids[i:i + 8]}
-        chunks.append({"state": record["state"], "questions": sub})
+        chunks.append(({"state": record["state"], "questions": sub}, dict(id_map)))
     return chunks
 
 
@@ -333,8 +333,8 @@ def cmd_forward(a):
     records = sample_records(read_records(a.data, a.records), small=a.small)
     expanded = []
     for item in records:
-        for ci, payload in enumerate(imajev_payloads(item["record"], native)):
-            expanded.append({"label": f"{item['label']}#{ci}", "record_payload": payload})
+        for ci, (payload, id_map) in enumerate(imajev_payloads(item["record"], native)):
+            expanded.append({"label": f"{item['label']}#{ci}", "record_payload": payload, "id_map": id_map})
     if a.max_chunks:   # CPU smoke: at most max_chunks per record, first come first served
         kept, counts = [], {}
         for e in expanded:
@@ -344,7 +344,7 @@ def cmd_forward(a):
                 kept.append(e)
         expanded = kept
     if a.long:
-        first = imajev_payloads(records[-1]["record"], native)[0]
+        first = imajev_payloads(records[-1]["record"], native)[0][0]
         padded = dict(first["state"])
         padded["padding"] = "long evidence. " * 600    # ~2.7k state tokens: past the graphed state pass, under max_length
         expanded.append({"label": "long_state", "record_payload": {**first, "state": padded}})
@@ -373,8 +373,26 @@ def cmd_forward(a):
             pn, pa = torch.softmax(n64, -1), torch.softmax(a64, -1)
             rn = field_result(native, meta["choices"][j], meta["token_ids"][j], [(offset, nlog)])
             ra = field_result(native, meta["choices"][j], meta["token_ids"][j], [(offset, alog)])
-            report_rows.append({"record": item["label"], "field_id": meta["fields"][j].id, "offset": offset,
+            labels_j = meta["labels"][j]
+            # decision position: the row's last token, its id, and which prefix group carried it
+            enc_i = next(i for i, em in enumerate(meta["encs"]) if (j, offset) in em["rows"])
+            t_row = meta["encs"][enc_i]["rows"].index((j, offset))
+            dec_pos, dec_tok = encs[enc_i]["decide_idx"][t_row], encs[enc_i]["ids"][encs[enc_i]["decide_idx"][t_row]]
+            report_rows.append({"record": item["label"], "field_id": meta["fields"][j].id,
+                                "qid": item["id_map"].get(meta["fields"][j].id, meta["fields"][j].id),
+                                "offset": offset, "labels": labels_j,
                                 "n_candidates": len(nlog),
+                                "decide_position": dec_pos, "decide_token_id": dec_tok,
+                                "logits_native": [round(x, 6) for x in nlog], "logits_adapted": [round(x, 6) for x in alog],
+                                "probs_native": [round(float(x), 8) for x in pn], "probs_adapted": [round(float(x), 8) for x in pa],
+                                "top2_margin_logit_native": round(float(n64.sort(descending=True).values[0] - n64.sort(descending=True).values[1]), 6),
+                                "top2_margin_logit_adapted": round(float(a64.sort(descending=True).values[0] - a64.sort(descending=True).values[1]), 6),
+                                "top2_margin_prob_native": round(float(pn.sort(descending=True).values[0] - pn.sort(descending=True).values[1]), 8),
+                                "top2_margin_prob_adapted": round(float(pa.sort(descending=True).values[0] - pa.sort(descending=True).values[1]), 8),
+                                "unknown_label": labels_j[-1] if labels_j else None,
+                                "unknown_logit_native": round(float(n64[-1]), 6), "unknown_logit_adapted": round(float(a64[-1]), 6),
+                                "native_pick": labels_j[int(n64.argmax())] if labels_j else None,
+                                "adapted_pick": labels_j[int(a64.argmax())] if labels_j else None,
                                 "max_abs_dlogit": float((n64 - a64).abs().max()),
                                 "max_abs_dprob": float((pn - pa).abs().max()),
                                 "argmax_flip": int(n64.argmax()) != int(a64.argmax()),
@@ -399,7 +417,8 @@ def cmd_forward(a):
         n_resp = native.jev_api.to_response(a_request, n_results, plan=plan)
         a_resp = score_request(model.imajev, a_request, plan, meta, picks)
         worst, bad = diff_answers(n_resp["answers"], a_resp["answers"])
-        answer_diffs.append({"record": item["label"], "kind": "answers_vs_native", "max_abs_diff": worst, "mismatch": bad})
+        answer_diffs.append({"record": item["label"], "kind": "answers_vs_native", "max_abs_diff": worst, "mismatch": bad,
+                             "answers_native": n_resp["answers"], "answers_adapted": a_resp["answers"]})
         groups = [enc["seg"].count(0) for enc in encs]
         print(f"[{time.strftime('%H:%M:%S')}] {item['label']}: {len(n_keys)} rows in {len(encs)} prefix group(s) "
               f"(state tokens {groups[:4]}{'...' if len(groups) > 4 else ''}), "
@@ -410,11 +429,24 @@ def cmd_forward(a):
     abstains = sum(r["abstain_flip"] for r in report_rows)
     worst_row = max(report_rows, key=lambda r: r["max_abs_dlogit"])
     worst_ans = max(d["max_abs_diff"] for d in answer_diffs if d["kind"] == "answers_vs_native")
+    def _pd(module):
+        try:
+            return str(next(module.parameters()).dtype)
+        except Exception as exc:
+            return f"n/a ({exc.__class__.__name__})"
+    dtype_block = {
+        "requested": a.dtype,
+        "native_engine_param": _pd(engine.model),
+        "kev_model_param": _pd(model),
+        "kev_readout_param": _pd(model.imajev.readout),
+        "native_engine_readout": _pd(engine.model.readout) if hasattr(engine.model, "readout") else "n/a",
+    }
     summary = {"rows": len(report_rows), "argmax_flips": flips, "abstain_flips": abstains,
                "max_abs_dlogit": worst_row["max_abs_dlogit"], "worst_row": {k: worst_row[k] for k in ("record", "field_id", "offset")},
                "max_abs_answer_diff": worst_ans, "mismatches": [d["mismatch"] for d in answer_diffs if d.get("mismatch")],
+               "dtype": dtype_block,
                "graphs": a.graphs, "fused": a.fused, "long": a.long, "rotations": a.rotations, "device": a.device,
-               "native_batch_1": a.native_batch_1, "adapted_single": a.adapted_single, "dtype": a.dtype}
+               "native_batch_1": a.native_batch_1, "adapted_single": a.adapted_single}
     print(json.dumps(summary, indent=1))
     if a.json_out:
         json.dump({"summary": summary, "rows": report_rows, "answers": answer_diffs}, open(a.json_out, "w"), indent=1)
