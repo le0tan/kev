@@ -6,6 +6,7 @@ whole backbone instead (kev.full_ft: bf16 weights, fp32 masters; several GPUs th
     uv run python -m kev.train --n_per_source 40 --accum 4 --out runs/smoke               # ~1 min smoke test
     uv run python -m kev.train --data mine.jsonl --init_from jaredpalmer/kev-4b --lr 2e-5 --out runs/mine   # delta
     torchrun --standalone --nproc_per_node 8 -m kev.train --full_ft 1 --weights_dtype bf16 --dtype bf16 --checkpointing 1 ...
+    torchrun --standalone --nproc_per_node 2 -m kev.train --lora_distributed 1 --batch 1 --accum 4 --row_budget 16384 ...
 
 Batch size is small (variable-length records with custom masks) and gradients are accumulated over --accum micro-batches
 (per rank: a step sees accum x batch x world size records).
@@ -16,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import torch
 import torch.nn.functional as F
-from . import full_ft
+from . import full_ft, lora_parallel
 from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache, sync
 from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
@@ -143,6 +144,7 @@ class Variant:
     source: str
     permuted: tuple | None = None   # (encoding under the other order, perms from permuted_copy)
     share: float = 1.0              # the part of its variant this is, when --row_budget split the variant's questions (row_passes)
+    loss_weight: float = 1.0
 
     @property
     def tokens(self):
@@ -175,14 +177,22 @@ def question_parts(enc, budget, shared):
     return parts
 
 
+def question_weight(q, enabled=True):
+    w = float(q.get("loss_weight", 1.0)) if enabled else 1.0
+    if not math.isfinite(w) or w <= 0:
+        raise ValueError(f"question {q.get('qid', '<unknown>')}: loss_weight must be finite and positive, got {w!r}")
+    return w
+
+
 NONE_OPTION_CHARS = 64   # a none-pair sibling's extra option, in the characters microbatch_plan measures (kev.data.NONE_OPTIONS' longest is shorter)
 
 
-def microbatch_plan(reqs, a, world, rank, pairs=None, shapes=None):
+def microbatch_plan(reqs, a, world, rank, pairs=None, shapes=None, *, pad_to_world=True):
     """This rank's micro-batches for one epoch of `reqs` (already shuffled), in order: (records, records in its optimizer
     step over all ranks, whether that step ends after it). Every rank gets the same number of micro-batches in every
-    step (FSDP2's collectives line up) and each record is seen once per epoch (the last step wraps around to fill every
-    rank, as full_ft.rank_share does).
+    step (FSDP2's collectives line up). With pad_to_world, the last step wraps around to fill every rank, as
+    full_ft.rank_share does. Distributed LoRA disables padding: every record is seen once, and a rank with no tail
+    records gets an empty micro-batch so it still joins the step's gradient collective.
     Plain: `--batch` consecutive records of this rank's share per micro-batch, `--accum` micro-batches per step.
     --length_sort 1: each step's records (batch x accum x world) are cut, in length order, into accum x world runs of
     neighbours whose largest padded cost (pass_tokens) is as small as possible (sizes vary: one long record, or many short
@@ -201,6 +211,14 @@ def microbatch_plan(reqs, a, world, rank, pairs=None, shapes=None):
     ran out of memory on a characters plan: a token-dense state (PII text, ~2 characters per token) set the padding of 16
     states (8 records and their siblings) at 5,877 tokens: 98.7k padded tokens in a slot whose other passes, costed the
     same in characters, held 33-50k."""
+    if not a.length_sort and not pad_to_world:
+        plan, per_step = [], a.batch * a.accum * world
+        for start in range(0, len(reqs), per_step):
+            step = reqs[start:start + per_step]
+            mine = step[rank::world]
+            n = math.ceil(len(step) / (world * a.batch))
+            plan += [(mine[mb * a.batch:(mb + 1) * a.batch], len(step), mb == n - 1) for mb in range(n)]
+        return plan
     if not a.length_sort:
         mine = full_ft.rank_share(reqs, rank, world)
         n = math.ceil(len(mine) / a.batch)
@@ -222,15 +240,16 @@ def microbatch_plan(reqs, a, world, rank, pairs=None, shapes=None):
     for start in range(0, len(reqs), per_step):
         step = reqs[start:start + per_step]
         m = math.ceil(len(step) / (world * a.batch))   # micro-batches per rank: accum, fewer in a short last step
-        step += step[:max(0, world * m - len(step))]    # so no micro-batch is empty; the repeats count in len(step), the
+        if pad_to_world: step += step[:max(0, world * m - len(step))]    # so no micro-batch is empty; the repeats count in len(step), the
                                                          # step's loss normaliser, as rank_share's do in the plain path
-        runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m, cost)
+        runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m if pad_to_world else min(world * m, len(step)), cost)
         while ceiling and max(map(cost, runs)) > ceiling:   # ends: world * m runs of one record each are all within it
             m += 1
             # a step with fewer records than runs (a short last step) repeats its cheapest, counted like the fill above
-            step += sorted(step, key=lambda r: cost([r]))[:max(0, world * m - len(step))]
-            runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m, cost)
+            if pad_to_world: step += sorted(step, key=lambda r: cost([r]))[:max(0, world * m - len(step))]
+            runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m if pad_to_world else min(world * m, len(step)), cost)
         runs = sorted(runs, key=cost, reverse=True)
+        if not pad_to_world: runs += [[] for _ in range(world * m - len(runs))]
         plan += [(runs[k * world + rank], len(step), k == m - 1) for k in range(m)]
     return plan
 
@@ -322,6 +341,16 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None):
     out, c = [], training_context(a.max_state)
     limits = {"max_state": c["max_state"], "max_branch": c["max_branch"]}
     for req in chunk:
+        loss_weight = 1.0
+        loss_weight_meta = getattr(a, "loss_weight_meta", "")
+        if loss_weight_meta:
+            raw = req.get("_meta", {}).get(loss_weight_meta, 1.0)
+            try:
+                loss_weight = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"{req.get('_meta', {}).get('id', '<unknown>')}: _meta.{loss_weight_meta} is not a number: {raw!r}") from None
+            if not math.isfinite(loss_weight) or loss_weight <= 0:
+                raise ValueError(f"{req.get('_meta', {}).get('id', '<unknown>')}: _meta.{loss_weight_meta} must be finite and positive, got {raw!r}")
         variants, item_rng = record_variants(req, a, epoch, pairs)
         for v in variants:
             rec = materialize(v)
@@ -329,10 +358,13 @@ def encode_batch(model, tok, a, chunk, epoch, pairs=None):
             if len(enc["ids"]) > c["max_packed"]:
                 raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
             parts = question_parts(enc, a.row_budget, a.shared_prefix)
+            q_weights = [question_weight(q, enabled=bool(loss_weight_meta)) for q in rec["questions"]]
+            total_q_weight = sum(q_weights)
             for part in parts:   # one part unless --row_budget splits a record whose rows do not fit one pass
                 sub = rec if len(parts) == 1 else {**rec, "questions": [rec["questions"][q] for q in part]}
+                share = sum(q_weights[q] for q in part) / total_q_weight
                 out.append(Variant(sub, enc if sub is rec else model.encode(tok, sub, strict=True, **limits), req["_meta"]["id"], req["_meta"]["source"],
-                                   share=len(part) / len(rec["questions"])))
+                                   share=share, loss_weight=loss_weight))
         if a.perm_kl > 0 and item_rng.random() < a.perm_frac and any(q["qtype"] == "choice" and len(q["options"]) >= 3 for q in rec["questions"]):
             rec2, perms = permuted_copy(rec, item_rng)
             out[-1].permuted = (model.encode(tok, rec2, strict=True, **limits), perms)
@@ -349,13 +381,14 @@ def batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast):
         logits2_b = model.forward_batch([v.permuted[0] for v in permuted], a.shared_prefix) if permuted else []
     loss = 0.0
     for v, logits in zip(batch, logits_b):
-        ce = sum(question_loss(z.float(), q, dev, a.ord_w, a.label_smoothing, a.brier_w, a.focal_gamma)
-                 for z, q in zip(logits, v.rec["questions"])) / len(logits) * v.share
+        q_weights = [question_weight(q, enabled=bool(getattr(a, "loss_weight_meta", ""))) for q in v.rec["questions"]]
+        ce = sum(question_loss(z.float(), q, dev, a.ord_w, a.label_smoothing, a.brier_w, a.focal_gamma) * w
+                 for z, q, w in zip(logits, v.rec["questions"], q_weights)) / sum(q_weights) * v.share * v.loss_weight
         terms["ce"] += ce.item(); loss = loss + ce
         if anchors and v.request_id in anchors and (anchor_sources is None or v.source in anchor_sources):
             kls = [t for t in (anchor_loss(z.float(), q, anchors[v.request_id].get(q["qid"]), dev) for z, q in zip(logits, v.rec["questions"])) if t is not None]
             if kls:
-                kl_a = sum(kls) / len(kls) * v.share; loss = loss + a.anchor_w * kl_a; terms["anchor"] += kl_a.item(); terms["anchor_n"] += v.share
+                kl_a = sum(kls) / len(kls) * v.share * v.loss_weight; loss = loss + a.anchor_w * kl_a; terms["anchor"] += kl_a.item(); terms["anchor_n"] += v.share * v.loss_weight
     for v, logits2 in zip(permuted, logits2_b):
         logits = logits_b[batch.index(v)]
         kls = [permutation_kl(z1.float(), z2.float(), perm, dev) for z1, z2, perm in zip(logits, logits2, v.permuted[1]) if perm is not None]
@@ -410,6 +443,8 @@ def parse_args():
     ap.add_argument("--anchor_sources", default="", help="comma-separated sources to anchor (default: every record with a target)")
     ap.add_argument("--out", default="runs/kev")
     ap.add_argument("--data", default="", help="your own labelled requests, one JSON object per line (see kev.data.load_records); an alternative to --suite for fine-tuning, or combined with --suite and --replay")
+    ap.add_argument("--loss_weight_meta", default="", help="opt-in _meta field containing a positive record loss multiplier, "
+                   "also enables question.loss_weight weighted means; default ignores both weight fields")
     ap.add_argument("--max_state", type=int, default=MAX_STATE, help=f"state tokens per training record (default {MAX_STATE}); raising it admits long-state --data records, the packed limit grows by the same amount")
     ap.add_argument("--replay", type=int, default=0, help="with --data and --suite: mix in this many records sampled (by --seed) from the suite's training partition, so a delta fine-tune does not forget the released recipe")
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
@@ -417,6 +452,9 @@ def parse_args():
                                                    "released model's in-domain skill while adapting to a new domain")
     ap.add_argument("--full_ft", type=int, choices=[0, 1], default=0, help="train every backbone weight (bf16, fp32 masters in kev.full_ft.MasterAdamW) instead of a LoRA; "
                                                                           "needs --weights_dtype bf16. One GPU: masters in host memory. Under torchrun: FSDP2 across the GPUs")
+    ap.add_argument("--lora_distributed", type=int, choices=[0, 1], default=0,
+                    help="torchrun: replicate the frozen backbone and sum LoRA/head gradients once per optimizer step; "
+                         "allows different row_budget pass counts per rank. Global batch = batch x accum x world")
     ap.add_argument("--row_budget", type=int, default=0, help="padded row tokens per forward/backward pass (0 = the whole micro-batch at once); a micro-batch over it "
                                                               "runs in several passes, a record whose rows do not fit is split by question (long states x many questions)")
     ap.add_argument("--shared_prefix", type=int, choices=[0, 1], default=None, help="hybrid backbones: run each record's state once and its question branches from it "
@@ -437,6 +475,11 @@ def parse_args():
     ap.add_argument("--snapshot_dir", default="", help="where snapshots go (default <out>-snapshots; a study trial's are <trial>/snapshots)")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if a.full_ft and a.lora_distributed: ap.error("--lora_distributed and --full_ft are separate training modes")
+    if world > 1 and not (a.full_ft or a.lora_distributed):
+        ap.error("torchrun LoRA requires --lora_distributed 1 (otherwise ranks would train and save independently)")
+    if a.lora_distributed and a.device == "mps": ap.error("distributed LoRA supports CUDA or CPU, not MPS")
     if a.shared_prefix is None: a.shared_prefix = a.full_ft
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
         ap.error("epochs, accum, n_per_source, lora, batch and synthetic_repeat must be positive; 0 < public_frac <= 1")
@@ -449,6 +492,11 @@ def parse_args():
         ap.error("use at most one finite, nonnegative loss modifier; smoothing must be <= 1")
     if bool(a.anchor) != (a.anchor_w > 0):
         ap.error("--anchor and --anchor_w > 0 go together")
+    if a.loss_weight_meta and a.p_none_pair > 0:
+        ap.error("--loss_weight_meta is not defined with --p_none_pair > 0; use ordinary augmented records or pre-materialise the siblings with explicit weights")
+    if a.lora_distributed and a.p_none_pair > 0:
+        ap.error("--lora_distributed is not defined with --p_none_pair > 0: the legacy sibling normalizer depends on local "
+                 "micro-batch grouping; pre-materialise siblings with explicit record weights")
     if not MAX_STATE <= a.max_state <= MAX_TRAIN_STATE:
         ap.error(f"--max_state must be in [{MAX_STATE}, {MAX_TRAIN_STATE}]")
     if a.none_pair_max_state is not None and (a.none_pair_max_state < 1 or a.p_none_pair <= 0):
@@ -464,10 +512,10 @@ def parse_args():
     if a.pass_tokens_max and (not a.length_sort or a.row_budget or a.perm_kl > 0):
         ap.error("--pass_tokens_max caps the passes --length_sort 1 plans: not without it, nor with --row_budget (which splits them "
                  "again), nor --perm_kl (a permuted copy is a second pass whose activations are alive at the same time)")
-    if a.row_budget and (a.perm_kl > 0 or a.anchor_w > 0 or int(os.environ.get("WORLD_SIZE", "1")) > 1):
+    if a.row_budget and (a.perm_kl > 0 or a.anchor_w > 0 or (a.full_ft and world > 1)):
         ap.error("--row_budget splits micro-batches into passes: not with --perm_kl (a record and its permuted copy share a loss term), "
                  "nor --anchor_w (a split record's parts would weight its anchored questions by their part's share of all its questions, "
-                 "not 1 / anchored questions), nor under torchrun (FSDP2 ranks must run the same number of backward passes; sharded "
+                 "not 1 / anchored questions), nor under full-weight torchrun (FSDP2 ranks must run the same number of backward passes; sharded "
                  "ranks have the memory without it)")
     if (a.save_every_steps or a.save_every_minutes or a.resume or a.stop_after) and not a.full_ft:
         ap.error("resume points are for full-weight runs (--full_ft 1)")
@@ -523,7 +571,7 @@ def pinned_revision(a, manifest):
 def main():
     a = parse_args()
     dev = a.device or default_device()
-    rank, world = full_ft.init_distributed(dev) if a.full_ft else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
+    rank, world = full_ft.init_distributed(dev) if a.full_ft or a.lora_distributed else (0, 1)   # torchrun: each rank's "cuda" is its own GPU
     out_dir = Path(a.out)
     if rank: sys.stdout = open(os.devnull, "w", encoding="utf-8")   # one log: rank 0's (errors still reach stderr)
     else: out_dir.mkdir(parents=True, exist_ok=bool(a.resume))
@@ -559,7 +607,10 @@ def main():
         # one runs the packed mask (rows_form) unless a record is over ROW_PASS_TOKENS, whose cost it does not measure
         raise SystemExit("kev.train: --pass_tokens_max needs a hybrid backbone (Gated DeltaNet: every pass runs as rows or a shared "
                          f"prefix, which pass_tokens measures); {a.base} is attention-only and runs the packed mask")
-    if world > 1: full_ft.shard(model)
+    if world > 1 and a.full_ft: full_ft.shard(model)
+    if world > 1 and a.lora_distributed:
+        lora_parallel.broadcast_parameters(model.trainable_parameters())
+        torch.manual_seed(a.seed + rank)   # data/augmentation streams stay rank-independent; dropout is rank-local
     print(f"device={dev} world={world} trainable params={sum(p.numel() for p in model.trainable_parameters())/1e6:.1f}M", flush=True)
 
     reqs = training_requests(a, tok, manifest, holdout)
@@ -579,7 +630,7 @@ def main():
     opt = full_ft.MasterAdamW(groups, lr=a.lr, weight_decay=a.weight_decay, offload=world == 1, max_grad_norm=MAX_GRAD_NORM) if a.full_ft else torch.optim.AdamW(groups, lr=a.lr, weight_decay=a.weight_decay)
     # counts only: they depend on len(reqs), not on the shuffle (--length_sort: one step per batch x accum x world records,
     # however many micro-batches the ceiling gives it)
-    per_epoch = math.ceil(len(reqs) / (a.batch * a.accum * world)) if a.pass_tokens_max else sum(ends for _, _, ends in microbatch_plan(reqs, a, world, rank))
+    per_epoch = math.ceil(len(reqs) / (a.batch * a.accum * world)) if a.pass_tokens_max else sum(ends for _, _, ends in microbatch_plan(reqs, a, world, rank, pad_to_world=not a.lora_distributed))
     steps = a.epochs * per_epoch
     steps = min(steps, a.max_steps) if a.max_steps else steps
     if a.full_ft and (problem := full_ft.too_many_snapshots(full_ft.snapshot_fractions(a.snapshot_fractions), a.snapshot_every_steps, steps)):
@@ -609,25 +660,29 @@ def main():
         if pairs is not None and not rank:
             print(f"none pairs: {len(pairs)} of {len(reqs)} records (states of at most {a.none_pair_max_state} tokens, p {a.p_none_pair})", flush=True)
         shapes = plan_shapes(model, tok, a, reqs, ep, pairs, state_tokens) if a.pass_tokens_max else None
-        plan = microbatch_plan(reqs, a, world, rank, pairs, shapes)   # every record once per epoch across the ranks (all of them on one GPU)
+        plan = microbatch_plan(reqs, a, world, rank, pairs, shapes, pad_to_world=not a.lora_distributed)   # every record once per epoch across the ranks (all of them on one GPU)
         if shapes is not None:   # every rank: the largest pass over the ranks is a collective
-            largest = int(full_ft.global_max([max(pass_tokens([s for r in chunk for s in shapes[id(r)]], a.shared_prefix) for chunk, _, _ in plan)])[0])
+            largest = int(full_ft.global_max([max((pass_tokens([s for r in chunk for s in shapes[id(r)]], a.shared_prefix) for chunk, _, _ in plan if chunk), default=0)])[0])
             if not rank:
                 print(f"plan: {len(plan)} micro-batches per rank for {sum(ends for _, _, ends in plan)} steps (--accum {a.accum}); "
                       f"the plan's largest pass {largest} of --pass_tokens_max {a.pass_tokens_max} padded tokens", flush=True)
         for mb in range(start_mb if ep == start_epoch else 0, len(plan)):
             chunk, step_records, ends_step = plan[mb]
-            batch = encode_batch(model, tok, a, chunk, ep, pairs)
-            variants = sum(v.share for v in batch)   # a record split by --row_budget counts once
-            # weight by source records in the accumulation group (over all ranks) so none-pair siblings do not inflate a record's share
-            group_records = step_records * (variants / len(chunk))
-            for part in row_passes(batch, a.row_budget, a.shared_prefix):
-                loss, terms = batch_loss(model, a, part, dev, anchors, anchor_sources, autocast)
-                (loss / group_records).backward()
-                run += terms
-            run["n"] += variants; seen += round(variants); tokens_seen += sum(v.tokens for v in batch)
-            peak_mem = max(peak_mem, allocated_bytes(dev))
+            if chunk:   # an empty tail rank still joins the optimizer-step collective
+                batch = encode_batch(model, tok, a, chunk, ep, pairs)
+                variants = sum(v.share for v in batch)   # a record split by --row_budget counts once
+                weighted_variants = sum(v.loss_weight * v.share for v in batch)
+                # Unweighted none-pair siblings keep the legacy normaliser. Explicit record weights instead define the
+                # effective loss contribution, so do not divide them back out.
+                group_records = step_records if a.loss_weight_meta else step_records * (weighted_variants / len(chunk))
+                for part in row_passes(batch, a.row_budget, a.shared_prefix):
+                    loss, terms = batch_loss(model, a, part, dev, anchors, anchor_sources, autocast)
+                    (loss / group_records).backward()
+                    run += terms
+                run["n"] += weighted_variants; seen += round(variants); tokens_seen += sum(v.tokens for v in batch)
+                peak_mem = max(peak_mem, allocated_bytes(dev))
             if ends_step:
+                if world > 1 and a.lora_distributed: lora_parallel.sum_gradients(model.trainable_parameters())
                 if not a.full_ft: norm = float(torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), MAX_GRAD_NORM, error_if_nonfinite=True))   # MasterAdamW clips by the global norm itself; both refuse a non-finite norm (a NaN gradient from a finite loss)
                 started = time.time(); opt.step(); sync(dev); optimizer_seconds += time.time() - started
                 grad_norms += [[] for _ in range(ep + 1 - len(grad_norms))]
@@ -636,7 +691,11 @@ def main():
                 step_seconds.append(round(time.time() - last, 3)); last = time.time()
                 if dev == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
                 if step % 10 == 0:
-                    print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
+                    if world > 1 and a.lora_distributed:
+                        keys = ("ce", "n", "kl", "kl_n", "anchor", "anchor_n")
+                        run = Counter(dict(zip(keys, full_ft.global_sum([run[k] for k in keys]))))
+                    logged_seen = full_ft.global_sum([seen])[0] if a.lora_distributed else seen
+                    print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/logged_seen:.3f}s/rec", flush=True)
                     run = Counter()
                 if step == steps: break
                 if snapshots and snapshots.due(step):
@@ -657,9 +716,12 @@ def main():
         print(f"stopped after step {step}; continue with --resume 1", flush=True); return
     seen, tokens_seen = full_ft.global_sum([seen, tokens_seen])   # ranks' micro-batches differ in size under --length_sort
 
+    if world > 1 and a.lora_distributed:
+        peak_mem = int(full_ft.global_max([peak_mem])[0])
     wall = time.time() - t0
     if a.full_ft: full_ft.save_backbone(model.lm, a.out)   # every rank: FSDP2 gathers to rank 0
-    else: model.lm.save_pretrained(a.out)
+    elif not rank: model.lm.save_pretrained(a.out)
+    if world > 1 and a.lora_distributed: torch.distributed.barrier()   # rank 0 finishes the adapter before peers leave
     if rank: return
     backbone_seconds = time.time() - t0 - wall
     shutil.rmtree(resume_dir, ignore_errors=True)   # the checkpoint supersedes it
@@ -676,4 +738,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if torch.distributed.is_initialized(): torch.distributed.destroy_process_group()
