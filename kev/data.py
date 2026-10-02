@@ -407,4 +407,6 @@ def materialize(req):
             t = [float(src_q["target"].get(k, 0.0)) for k in q["keys"]]
             if sum(t) <= 0: raise ValueError(f"target for {qid} puts no mass on any option")
             q["target"] = [x / sum(t) for x in t]
+        if src_q.get("loss_weight") is not None:
+            q["loss_weight"] = src_q["loss_weight"]   # the opt-in trainer validates it; other callers ignore the field
     return rec

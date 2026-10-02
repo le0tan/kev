@@ -132,12 +132,13 @@ def test_load_records_jsonl(tmp_path):
     rows = [{"state": {"subject": "Charged twice", "body": "Two charges for order 4411."},
              "questions": {"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "Payments", "shipping": None}, "label": "billing"},
                            "angry": {"type": "noul", "instructions": "Is the customer angry?", "label": False},
-                           "priority": {"type": "score", "instructions": "How urgent?", "criteria": ["low", "normal", "high"], "label": 1}}}]
+                           "priority": {"type": "score", "instructions": "How urgent?", "criteria": ["low", "normal", "high"], "label": 1, "loss_weight": 2.5}}}]
     p = tmp_path / "train.jsonl"; write_jsonl(p, rows)
     recs = load_records(p)
     assert recs[0]["_meta"]["source"] == "custom" and recs[0]["_meta"]["variant"] == "clean"
     rec = materialize(recs[0])
     assert [q["label"] for q in rec["questions"]] == [0, 0, 1] and rec["questions"][0]["src"] == "custom_choice"
+    assert rec["questions"][2]["loss_weight"] == 2.5
     bad = tmp_path / "bad.jsonl"; write_jsonl(bad, [{"state": "x", "questions": {"q": {"type": "noul", "instructions": "?"}}}])
     try: load_records(bad); assert False
     except ValueError as e: assert "no label" in str(e)
@@ -914,6 +915,93 @@ def test_row_budget_changes_passes_not_gradients(tiny_base, shared):
     assert sizes == [(4, 1, 4.0), (8, 8, 4.0)]
     scale = max(g.abs().max() for g in grads[0])
     assert all(torch.allclose(a, b, atol=1e-5 * scale) for a, b in zip(*grads))   # fp32 summation order (the shared prefix pads states differently per pass)
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+def test_loss_weight_shares_survive_row_budget_splits(tiny_base, shared):
+    """With explicit weights, --row_budget partitions by question weight; without opt-in, question weights are ignored."""
+    from kev.data import load_records
+    from kev.model import MAX_STATE, load_tokenizer
+    from kev.train import encode_batch
+    tok = load_tokenizer(str(tiny_base / "base"))
+    model = DecisionModel(str(tiny_base / "base"), tok, "cpu")
+    reqs = load_records(tiny_base / "data.jsonl")[:3]
+    for ri, r in enumerate(reqs):
+        r["_meta"]["loss_weight"] = 1.0 + ri
+        template = r["questions"]["angry"]
+        for extra in range(3):
+            r["questions"][f"extra{extra}"] = {**template, "instructions": template["instructions"] + " it" * extra, "label": bool(extra % 2)}
+        for i, q in enumerate(r["questions"].values()):
+            q["loss_weight"] = 1.0 + i
+    knobs = dict(seed=0, p_none=0.0, p_none_distract=0.0, p_distract=0.0, p_none_pair=0.0, perm_kl=0.0, perm_frac=0.0, max_state=MAX_STATE,
+                 shared_prefix=shared)
+    weighted = encode_batch(model, tok, SimpleNamespace(**knobs, row_budget=16, loss_weight_meta="loss_weight"), reqs, 0)
+    assert len(weighted) > len(reqs)
+    by_id = {}
+    for v in weighted:
+        by_id.setdefault(v.request_id, []).append(v)
+    for r in reqs:
+        total_q = sum(float(q["loss_weight"]) for q in r["questions"].values())
+        parts = by_id[r["_meta"]["id"]]
+        assert sum(v.share for v in parts) == pytest.approx(1.0)
+        assert sum(v.loss_weight * v.share for v in parts) == pytest.approx(float(r["_meta"]["loss_weight"]))
+        for v in parts:
+            part_q = sum(float(q["loss_weight"]) for q in v.rec["questions"])
+            assert v.share == pytest.approx(part_q / total_q)
+    default = encode_batch(model, tok, SimpleNamespace(**knobs, row_budget=16, loss_weight_meta=""), reqs, 0)
+    for v in default:
+        source = next(r for r in reqs if r["_meta"]["id"] == v.request_id)
+        assert v.loss_weight == 1.0
+        assert v.share == pytest.approx(len(v.rec["questions"]) / len(source["questions"]))
+
+
+@pytest.mark.parametrize("weight", [0, -1, float("nan"), "not-a-number"])
+def test_question_loss_weight_validation_is_opt_in(weight):
+    from kev.data import materialize
+    from kev.train import question_weight
+    question = materialize({"state": "s", "questions": {"q": {
+        "type": "noul", "instructions": "check", "label": True, "src": "unit", "loss_weight": weight}}})["questions"][0]
+    assert question_weight(question, enabled=False) == 1.0
+    with pytest.raises(ValueError): question_weight(question, enabled=True)
+
+
+@pytest.mark.parametrize("shared", [0, 1])
+def test_loss_weights_survive_row_budget_gradients_on_cuda(tiny_base, shared):
+    """On the real CUDA path, weighted row-budget parts accumulate to the same gradients as the unsplit weighted batch,
+    including unequal records and a tail-sized microbatch."""
+    if not torch.cuda.is_available():
+        pytest.skip("Qwen3.5 causal_conv1d test path requires CUDA")
+    import contextlib
+    from kev.data import load_records
+    from kev.model import MAX_STATE, load_tokenizer
+    from kev.train import batch_loss, encode_batch, row_passes
+    tok = load_tokenizer(str(tiny_base / "base"))
+    dev = "cuda"
+    model = DecisionModel(str(tiny_base / "base"), tok, dev); model.train()
+    reqs = load_records(tiny_base / "data.jsonl")[:3]
+    for ri, r in enumerate(reqs):
+        r["_meta"]["loss_weight"] = 1.0 + ri
+        template = r["questions"]["angry"]
+        for extra in range(ri + 1):
+            r["questions"][f"extra{extra}"] = {**template, "instructions": template["instructions"] + " it" * extra, "label": bool(extra % 2)}
+        for i, q in enumerate(r["questions"].values()):
+            q["loss_weight"] = 1.0 + 0.5 * i
+    knobs = dict(seed=0, p_none=0.0, p_none_distract=0.0, p_distract=0.0, p_none_pair=0.0, perm_kl=0.0, perm_frac=0.0, max_state=MAX_STATE,
+                 ord_w=0.0, label_smoothing=0.0, brier_w=0.0, focal_gamma=0.0, anchor_w=0.0, shared_prefix=shared, loss_weight_meta="loss_weight")
+    grads, weighted, pass_counts = [], [], []
+    for budget in (0, 16):
+        a = SimpleNamespace(**knobs, row_budget=budget)
+        batch = encode_batch(model, tok, a, reqs, 0); model.zero_grad()
+        passes = row_passes(batch, budget, shared)
+        weighted.append(sum(v.loss_weight * v.share for v in batch))
+        pass_counts.append(len(passes))
+        for part in passes:
+            batch_loss(model, a, part, dev, {}, None, contextlib.nullcontext())[0].backward()
+        grads.append([p.grad.clone() for p in model.parameters() if p.grad is not None])
+    assert weighted == pytest.approx([6.0, 6.0])
+    assert pass_counts[1] > pass_counts[0]
+    scale = max(g.abs().max() for g in grads[0])
+    assert all(torch.allclose(a, b, rtol=1e-4, atol=1e-4 * scale) for a, b in zip(*grads))
 
 
 @pytest.mark.parametrize("checkpointing,lora", [(False, 0), (True, 0), (True, 4)])
